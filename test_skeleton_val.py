@@ -364,11 +364,13 @@ def evaluate_coordinate_reconstruction(model, dataloader, device, mask_ratio=0.1
     
     # 全バッチの距離を結合: [B1,T,V] + [B2,T,V] + ... → [N,T,V] (N=全サンプル数)
     distances_cat = torch.cat(all_distances, dim=0)  # [N,T,V]
+    overall_mean_error = float(distances_cat.mean().item())
     
     # マスクされた関節とマスクされていない関節を区別して統計を計算
     # - masked: マスクされた関節の再構成誤差（学習対象）
     # - unmasked: マスクされていない関節の再構成誤差（参考値）
     stats = aggregate_batch_errors_from_distances(distances_cat, all_mask_indices)
+    stats["overall_mean_error"] = overall_mean_error
     return stats
 
 
@@ -419,6 +421,7 @@ def main():
     )
 
     print("\n=== Coordinate Reconstruction on VAL ===")
+    print(f"Overall mean error: {stats['overall_mean_error']:.4f} m")
     print(f"Masked micro mean:  {stats['micro_masked_mean']:.4f} m")
     print(f"Unmasked micro mean:{stats['micro_unmasked_mean']:.4f} m")
     print(f"Masked macro mean:  {stats['macro_masked_mean']:.4f} m")

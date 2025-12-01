@@ -67,6 +67,7 @@ class ST_GCN_18(nn.Module):
             st_gcn_block(feature_dim, feature_dim, kernel_size, 1, **kwargs),
             st_gcn_block(feature_dim, feature_dim, kernel_size, 1, **kwargs),
             st_gcn_block(feature_dim, feature_dim, kernel_size, 1, **kwargs),
+            st_gcn_block(feature_dim, feature_dim, kernel_size, 1, **kwargs),
         ))
 
         # initialize parameters for edge importance weighting

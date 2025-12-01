@@ -27,11 +27,29 @@ SKELETON_EDGES = [
     (15, 19), (19, 20), (20, 21),  # 左足
 ]
 
+PART_GROUPS = {
+    "center_upper": [0, 1, 2, 3, 7],
+    "center_lower": [11, 12, 13, 14, 15],
+    "right_limb": [4, 5, 6, 16, 17, 18],
+    "left_limb": [8, 9, 10, 19, 20, 21],
+}
+PART_GROUPS2 = {
+    "head": [0, 1],
+    "neck": [2, 3, 7],
+    "upper_torso": [11, 12],
+    "lower_torso": [13, 14],
+    "hips": [15, 16, 19],
+    "right_arm": [4, 5, 6],
+    "left_arm": [8, 9, 10],
+    "right_leg": [17, 18],
+    "left_leg": [20, 21],
+}
+
 PLOT_COLORS = {
-    'original_cloud': '#b3cde3',
-    'original_edge': '#9ecae1',
-    'visible_joint': '#1f77b4',
-    'visible_edge': '#1f77b4',
+    'original_cloud': '#00008B',
+    'original_edge': '#00008B',
+    'visible_joint': '#00008B',
+    'visible_edge': '#00008B',
     'masked_joint': '#ff7f0e',
     'masked_placeholder': '#d62728',
     'reconstructed_joint': '#2ca02c',
@@ -43,16 +61,47 @@ DEFAULT_VIEW = {
     'azim':180.0,
 }
 
+def sample_bodypart_mask(target=11, tol=1):
+    """
+    PART_GROUPS2 からランダムにパートを選び、
+    関節の合計数が target±tol に収まったところで止める
+    """
+    part_names = list(PART_GROUPS2.keys())
+    random.shuffle(part_names)
+
+    selected_parts = []
+    selected_joints = set()
+
+    for name in part_names:
+        # このパーツを追加したら何個になるか
+        new_joints = selected_joints.union(PART_GROUPS2[name])
+        if len(new_joints) == 10 or len(new_joints) ==12:
+            continue
+
+        selected_parts.append(name)
+        selected_joints = new_joints
+
+        if 11 == len(selected_joints): # 目標に達したら止める
+            break
+
+    return sorted(list(selected_joints))
+
 
 def to_numpy_indices(indices):
     """Convert masked joint indices to a numpy array."""
     if indices is None:
         return np.array([], dtype=int)
-    if isinstance(indices, torch.Tensor):
-        return indices.detach().cpu().numpy().astype(int)
-    if isinstance(indices, (list, tuple, np.ndarray)):
-        return np.asarray(indices, dtype=int)
-    return np.array([int(indices)], dtype=int)
+
+    if isinstance(indices, (list, tuple)):
+        if len(indices) == 0:
+            return np.array([], dtype=int)
+        # 可視化用途なので、先頭フレームのマスクを代表として使用
+        return to_numpy_indices(indices[0])
+
+    tensor = collapse_mask_indices(indices)
+    if tensor.numel() == 0:
+        return np.array([], dtype=int)
+    return tensor.numpy().astype(int)
 
 
 def to_numpy_array(array_like):
@@ -81,7 +130,76 @@ def _unique_legend_entries(legend_entries):
     return handles, labels
 
 
-def mask_skeleton_joints(data, mask_ratio=0.15, mask_token=0.0, mask_indices=None):
+def collapse_mask_indices(mask_indices_sample):
+    """
+    Convert mask indices for a single sample into a unique 1-D CPU tensor.
+    Supports per-frame lists as well as flat tensors/lists.
+    """
+    if mask_indices_sample is None:
+        return torch.empty(0, dtype=torch.long)
+
+    if torch.is_tensor(mask_indices_sample):
+        return mask_indices_sample.detach().cpu().view(-1)
+
+    if isinstance(mask_indices_sample, np.ndarray):
+        return torch.from_numpy(mask_indices_sample.astype(np.int64)).view(-1)
+
+    if isinstance(mask_indices_sample, (list, tuple)):
+        tensors = []
+        for item in mask_indices_sample:
+            t = collapse_mask_indices(item)
+            if t.numel() > 0:
+                tensors.append(t.view(-1))
+        if not tensors:
+            return torch.empty(0, dtype=torch.long)
+        concatenated = torch.cat(tensors)
+        return torch.unique(concatenated)
+
+    return torch.tensor([int(mask_indices_sample)], dtype=torch.long)
+
+
+def get_frame_mask_indices(mask_indices, sample_idx=0, frame_idx=0):
+    """
+    Return a CPU long tensor of masked joints for the specified sample/frame.
+    Falls back gracefully if indices are stored in legacy formats.
+    """
+    if mask_indices is None:
+        return torch.empty(0, dtype=torch.long)
+
+    target = mask_indices
+    if isinstance(target, (list, tuple)):
+        if len(target) == 0:
+            return torch.empty(0, dtype=torch.long)
+        sample_idx = max(min(sample_idx, len(target) - 1), 0)
+        target = target[sample_idx]
+        if isinstance(target, (list, tuple)):
+            if len(target) == 0:
+                return torch.empty(0, dtype=torch.long)
+            frame_idx = max(min(frame_idx, len(target) - 1), 0)
+            target = target[frame_idx]
+
+    return collapse_mask_indices(target)
+
+
+def get_frame_mask_numpy(mask_indices, sample_idx=0, frame_idx=0):
+    """Helper that returns masked joint indices as a numpy array for a frame."""
+    tensor = get_frame_mask_indices(mask_indices, sample_idx=sample_idx, frame_idx=frame_idx)
+    if tensor.numel() == 0:
+        return np.array([], dtype=int)
+    return tensor.numpy().astype(int)
+
+
+def _ensure_long_tensor(indices, device):
+    if torch.is_tensor(indices):
+        return indices.to(device=device, dtype=torch.long).view(-1)
+    if isinstance(indices, (list, tuple, np.ndarray)):
+        if len(indices) == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.as_tensor(indices, device=device, dtype=torch.long).view(-1)
+    return torch.tensor([int(indices)], device=device, dtype=torch.long)
+
+
+def mask_skeleton_joints(data, mask_ratio=0.15, mask_token=0.0, mask_indices=None, batch_idx=0):
     """
     スケルトンデータの関節をマスクする（座標空間・特徴空間共通）
     
@@ -99,40 +217,530 @@ def mask_skeleton_joints(data, mask_ratio=0.15, mask_token=0.0, mask_indices=Non
     masked_data = data.clone()
     device = data.device
     
-    # マスクインデックスが指定されていない場合は生成
     if mask_indices is None:
         mask_indices = []
-        for b in range(batch_size):
-            # マスクする関節数を計算
-            num_masked = int(num_joints * mask_ratio)
-            
-            # ランダムにマスクする関節を選択（デバイス一致）
-            masked_joints = torch.randperm(num_joints, device=device)[:num_masked]
-            mask_indices.append(masked_joints)
-    
-    # バッチごとにマスク
+        for _ in range(batch_size):
+            per_frame = []
+            # if batch_idx%2==0:
+            #     num_masked = int(num_joints * mask_ratio)
+            #     masked_joints = torch.randperm(num_joints, device=device)[:num_masked]
+            for _ in range(seq_len):
+                # 各部位ごとにマスクする関節数を計算
+                # if batch_idx%2==1:
+                num_masked = int(num_joints * mask_ratio)
+                masked_joints = torch.randperm(num_joints, device=device)[:num_masked]
+                per_frame.append(masked_joints)
+                # パーツまとめてマスク
+                # chosen = random.sample(PART_GROUPS.keys(), 2)
+                # masked_joints = sorted(set(idx for name in chosen for idx in PART_GROUPS[name]))
+                # per_frame.append(torch.tensor(masked_joints, device=device, dtype=torch.long))
+                # 細かいパーツまとめてマスク
+                # target_joints = sample_bodypart_mask(target=11, tol=1)
+                # per_frame.append(torch.tensor(target_joints, device=device, dtype=torch.long))
+            mask_indices.append(per_frame)
+
+    if isinstance(mask_token, torch.Tensor):
+        token = mask_token.to(device)
+        if token.dim() == 4:
+            token = token.squeeze(0).squeeze(0).squeeze(0)
+    else:
+        token = mask_token
+
     for b in range(batch_size):
-        masked_joints = mask_indices[b]
-        if len(masked_joints) > 0:
-            # マスクトークンがテンソルの場合（特徴空間）とスカラーの場合（座標空間）を処理
-            if isinstance(mask_token, torch.Tensor):
-                # 特徴空間: マスクトークンをブロードキャスト
-                if mask_token.dim() == 4:  # [1, 1, 1, feature_dim]
-                    masked_data[b, :, masked_joints, :] = mask_token.squeeze(0).squeeze(0).squeeze(0)
-                else:  # [feature_dim]
-                    masked_data[b, :, masked_joints, :] = mask_token
+        for t in range(seq_len):
+            masked_joints = mask_indices[b][t]
+            if masked_joints.numel() == 0:
+                continue
+            if isinstance(token, torch.Tensor):
+                masked_data[b, t, masked_joints, :] = token
             else:
-                # 座標空間: スカラー値
-                masked_data[b, :, masked_joints, :] = mask_token
+                masked_data[b, t, masked_joints, :] = token
     
     return masked_data, mask_indices
+
+
+def _setup_axis(ax, title=None):
+    ax.set_facecolor('#fbfbfb')
+    ax.grid(False)
+    if title is not None:
+        ax.set_title(title)
+
+
+def _scatter_points(
+    ax,
+    coords,
+    indices=None,
+    *,
+    color,
+    size,
+    marker='o',
+    alpha=1.0,
+    edgecolor=None,
+    linewidth=0.0,
+):
+    x, y, z = coords
+    if indices is None:
+        xs, ys, zs = x, y, z
+    else:
+        xs, ys, zs = x[indices], y[indices], z[indices]
+    ax.scatter(
+        xs,
+        ys,
+        zs,
+        color=color,
+        s=size,
+        marker=marker,
+        alpha=alpha,
+        edgecolor=edgecolor,
+        linewidths=linewidth,
+        depthshade=False,
+    )
+
+
+def _draw_edges(ax, coords, *, predicate=None, color, linewidth, alpha):
+    x, y, z = coords
+    joint_count = len(x)
+    for i, j in SKELETON_EDGES:
+        if i >= joint_count or j >= joint_count:
+            continue
+        if predicate is not None and not predicate(i, j):
+            continue
+        ax.plot(
+            [x[i], x[j]],
+            [y[i], y[j]],
+            [z[i], z[j]],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+        )
+
+
+def _mask_observed_coords(mask_coords_raw, orig_coords, masked_ids):
+    if masked_ids.size == 0:
+        return mask_coords_raw
+    masked = [arr.copy() for arr in mask_coords_raw]
+    for dst, src in zip(masked, orig_coords):
+        dst[masked_ids] = src[masked_ids]
+    return tuple(masked)
+
+
+def _subset_coords(coords, indices):
+    if indices.size == 0:
+        return None
+    return tuple(arr[indices] for arr in coords)
+
+
+def _finalize_axis(ax, coord_sets, margin=0.08):
+    x_arrays, y_arrays, z_arrays = [], [], []
+    for coords in coord_sets:
+        if coords is None:
+            continue
+        x_arrays.append(coords[0])
+        y_arrays.append(coords[1])
+        z_arrays.append(coords[2])
+    if not x_arrays:
+        return
+    set_axes_equal(ax, x_arrays, y_arrays, z_arrays, margin=margin)
+    set_camera_view(ax)
+
+
+def _draw_original_view(ax, orig_coords, *, title, point_size=40, edge_width=1.2, alpha=0.85):
+    _setup_axis(ax, title)
+    _scatter_points(ax, orig_coords, color=PLOT_COLORS['original_cloud'], size=point_size, alpha=alpha)
+    _draw_edges(
+        ax,
+        orig_coords,
+        color=PLOT_COLORS['original_edge'],
+        linewidth=edge_width,
+        alpha=0.6,
+    )
+    _finalize_axis(ax, [orig_coords])
+
+
+def _draw_mask_view(
+    ax,
+    orig_coords,
+    mask_coords,
+    mask_coords_raw,
+    masked_ids,
+    unmasked_ids,
+    *,
+    title,
+    visible_size=55,
+    masked_size=82,
+    token_size=46,
+    visible_edge_width=1.8,
+    masked_edge_width=2.0,
+):
+    _setup_axis(ax, title)
+    if unmasked_ids.size > 0:
+        _scatter_points(
+            ax,
+            mask_coords,
+            unmasked_ids,
+            color=PLOT_COLORS['visible_joint'],
+            size=visible_size,
+            alpha=0.95,
+        )
+    if masked_ids.size > 0:
+        _scatter_points(
+            ax,
+            mask_coords_raw,
+            masked_ids,
+            color=PLOT_COLORS['masked_placeholder'],
+            size=token_size,
+            marker='x',
+            alpha=0.75,
+            linewidth=1.2,
+        )
+        _scatter_points(
+            ax,
+            orig_coords,
+            masked_ids,
+            color=PLOT_COLORS['masked_joint'],
+            size=masked_size,
+            marker='o',
+            alpha=0.95,
+            edgecolor='k',
+            linewidth=0.6,
+        )
+    masked_set = set(masked_ids.tolist())
+    unmasked_set = set(unmasked_ids.tolist())
+    _draw_edges(
+        ax,
+        orig_coords,
+        predicate=lambda i, j: i in masked_set and j in masked_set,
+        color=PLOT_COLORS['masked_joint'],
+        linewidth=masked_edge_width,
+        alpha=0.85,
+    )
+    _draw_edges(
+        ax,
+        mask_coords,
+        predicate=lambda i, j: i in unmasked_set and j in unmasked_set,
+        color=PLOT_COLORS['visible_edge'],
+        linewidth=visible_edge_width,
+        alpha=0.85,
+    )
+    _finalize_axis(
+        ax,
+        [
+            orig_coords,
+            mask_coords,
+            _subset_coords(mask_coords_raw, masked_ids),
+        ],
+    )
+
+
+def _draw_reconstructed_plain_view(
+    ax,
+    recon_coords,
+    *,
+    title,
+    point_size=55,
+    edge_width=1.6,
+    alpha=0.9,
+):
+    _setup_axis(ax, title)
+    _scatter_points(
+        ax,
+        recon_coords,
+        color=PLOT_COLORS['reconstructed_joint'],
+        size=point_size,
+        alpha=alpha,
+    )
+    _draw_edges(
+        ax,
+        recon_coords,
+        color=PLOT_COLORS['reconstructed_edge'],
+        linewidth=edge_width,
+        alpha=0.8,
+    )
+    _finalize_axis(ax, [recon_coords])
+
+
+def _draw_reconstructed_error_view(
+    ax,
+    orig_coords,
+    recon_coords,
+    masked_ids,
+    unmasked_ids,
+    *,
+    title,
+    visible_size=60,
+    masked_size=80,
+    dashed_alpha=0.6,
+    dashed_width=0.9,
+    orig_alpha=0.25,
+):
+    _setup_axis(ax, title)
+    _scatter_points(
+        ax,
+        orig_coords,
+        color=PLOT_COLORS['original_cloud'],
+        size=28,
+        alpha=orig_alpha,
+    )
+    _draw_edges(
+        ax,
+        orig_coords,
+        color=PLOT_COLORS['original_edge'],
+        linewidth=1.0,
+        alpha=0.35,
+    )
+    if unmasked_ids.size > 0:
+        _scatter_points(
+            ax,
+            recon_coords,
+            unmasked_ids,
+            color=PLOT_COLORS['reconstructed_joint'],
+            size=visible_size,
+            marker='o',
+            alpha=0.9,
+        )
+    if masked_ids.size > 0:
+        _scatter_points(
+            ax,
+            recon_coords,
+            masked_ids,
+            color=PLOT_COLORS['reconstructed_joint'],
+            size=masked_size,
+            marker='^',
+            alpha=0.95,
+        )
+    x, y, z = orig_coords
+    xr, yr, zr = recon_coords
+    for idx in range(len(x)):
+        ax.plot(
+            [x[idx], xr[idx]],
+            [y[idx], yr[idx]],
+            [z[idx], zr[idx]],
+            color='#7f7f7f',
+            linestyle='--',
+            linewidth=dashed_width,
+            alpha=dashed_alpha,
+        )
+    _draw_edges(
+        ax,
+        recon_coords,
+        color=PLOT_COLORS['reconstructed_edge'],
+        linewidth=1.4,
+        alpha=0.75,
+    )
+    _finalize_axis(ax, [orig_coords, recon_coords])
+
+
+def _draw_mask_state_overview(
+    ax,
+    orig_coords,
+    masked_ids,
+    *,
+    title,
+    unmasked_color="#1f6ff6",
+    masked_color="#555555",
+    bridge_color="#7a7a7a",
+    unmasked_size=52,
+    masked_size=60,
+    edge_width=1.6,
+    bridge_width=1.2,
+):
+    _setup_axis(ax, title)
+    total_joints = orig_coords[0].shape[0]
+    all_indices = np.arange(total_joints)
+    masked_ids = np.asarray(masked_ids, dtype=int)
+    if masked_ids.size == 0:
+        masked_ids = np.array([], dtype=int)
+    unmasked_ids = np.setdiff1d(all_indices, masked_ids, assume_unique=True)
+    masked_set = set(masked_ids.tolist())
+    unmasked_set = set(unmasked_ids.tolist())
+
+    if unmasked_ids.size > 0:
+        _scatter_points(
+            ax,
+            orig_coords,
+            unmasked_ids,
+            color=unmasked_color,
+            size=unmasked_size,
+            alpha=0.95,
+            marker="o",
+        )
+    if masked_ids.size > 0:
+        _scatter_points(
+            ax,
+            orig_coords,
+            masked_ids,
+            color=masked_color,
+            size=masked_size,
+            alpha=0.95,
+            marker="o",
+        )
+
+    if unmasked_set:
+        _draw_edges(
+            ax,
+            orig_coords,
+            predicate=lambda i, j: i in unmasked_set and j in unmasked_set,
+            color=unmasked_color,
+            linewidth=edge_width,
+            alpha=0.85,
+        )
+    if masked_set:
+        _draw_edges(
+            ax,
+            orig_coords,
+            predicate=lambda i, j: i in masked_set and j in masked_set,
+            color=masked_color,
+            linewidth=edge_width,
+            alpha=0.85,
+        )
+    if masked_set and unmasked_set:
+        _draw_edges(
+            ax,
+            orig_coords,
+            predicate=lambda i, j: (i in masked_set) ^ (j in masked_set),
+            color=bridge_color,
+            linewidth=bridge_width,
+            alpha=0.75,
+        )
+
+    _finalize_axis(ax, [orig_coords])
+
+
+def _draw_overlay_view(
+    ax,
+    orig_coords,
+    mask_coords,
+    mask_coords_raw,
+    recon_coords,
+    masked_ids,
+    unmasked_ids,
+    *,
+    title,
+    base_size=22,
+    observed_size=55,
+    token_size=40,
+    masked_size=80,
+    recon_mask_size=90,
+    recon_visible_size=55,
+):
+    _setup_axis(ax, title)
+    _scatter_points(
+        ax,
+        orig_coords,
+        color=PLOT_COLORS['original_cloud'],
+        size=base_size,
+        alpha=0.3,
+    )
+    if unmasked_ids.size > 0:
+        _scatter_points(
+            ax,
+            mask_coords,
+            unmasked_ids,
+            color=PLOT_COLORS['visible_joint'],
+            size=observed_size,
+            alpha=0.9,
+        )
+        _scatter_points(
+            ax,
+            recon_coords,
+            unmasked_ids,
+            color=PLOT_COLORS['reconstructed_joint'],
+            size=recon_visible_size,
+            alpha=0.8,
+        )
+    if masked_ids.size > 0:
+        _scatter_points(
+            ax,
+            mask_coords_raw,
+            masked_ids,
+            color=PLOT_COLORS['masked_placeholder'],
+            size=token_size,
+            marker='x',
+            alpha=0.75,
+            linewidth=1.1,
+        )
+        _scatter_points(
+            ax,
+            orig_coords,
+            masked_ids,
+            color=PLOT_COLORS['masked_joint'],
+            size=masked_size,
+            marker='o',
+            alpha=0.9,
+            edgecolor='k',
+            linewidth=0.6,
+        )
+        _scatter_points(
+            ax,
+            recon_coords,
+            masked_ids,
+            color=PLOT_COLORS['masked_joint'],
+            size=recon_mask_size,
+            marker='^',
+            alpha=0.9,
+            edgecolor='k',
+            linewidth=0.6,
+        )
+        x, y, z = orig_coords
+        xr, yr, zr = recon_coords
+        for idx in masked_ids:
+            ax.plot(
+                [x[idx], xr[idx]],
+                [y[idx], yr[idx]],
+                [z[idx], zr[idx]],
+                color='#7f7f7f',
+                linestyle='--',
+                linewidth=1.0,
+                alpha=0.75,
+            )
+    masked_set = set(masked_ids.tolist())
+    unmasked_set = set(unmasked_ids.tolist())
+    _draw_edges(
+        ax,
+        orig_coords,
+        color=PLOT_COLORS['original_edge'],
+        linewidth=1.1,
+        alpha=0.35,
+    )
+    _draw_edges(
+        ax,
+        mask_coords,
+        predicate=lambda i, j: i in unmasked_set and j in unmasked_set,
+        color=PLOT_COLORS['visible_edge'],
+        linewidth=2.0,
+        alpha=0.8,
+    )
+    _draw_edges(
+        ax,
+        orig_coords,
+        predicate=lambda i, j: i in masked_set and j in masked_set,
+        color=PLOT_COLORS['masked_joint'],
+        linewidth=2.0,
+        alpha=0.85,
+    )
+    _draw_edges(
+        ax,
+        recon_coords,
+        color=PLOT_COLORS['reconstructed_edge'],
+        linewidth=1.8,
+        alpha=0.75,
+    )
+    _finalize_axis(
+        ax,
+        [
+            orig_coords,
+            mask_coords,
+            recon_coords,
+            _subset_coords(mask_coords_raw, masked_ids),
+        ],
+    )
 
 
 def plot_skeleton_visualization(original_data, masked_data, mask_indices, save_path, title="Skeleton Visualization"):
     """スケルトンの可視化（マスク位置表示版）"""
     original_patch = original_data[0]
     masked_patch = masked_data[0]
-    masked_ids = to_numpy_indices(mask_indices[0])
+    masked_ids = get_frame_mask_numpy(mask_indices, sample_idx=0, frame_idx=0)
     masked_ids = np.sort(masked_ids)
     
     fig = plt.figure(figsize=(12, 8))
@@ -158,36 +766,27 @@ def plot_skeleton_visualization(original_data, masked_data, mask_indices, save_p
     unmasked_indices = joint_idx[unmasked_mask]
     unmasked_set = set(unmasked_indices.tolist())
 
-    legend_entries = []
-
-    # 1. 元のスケルトン全体（透明度を下げた薄い色で基準表示）
-    handle = ax.scatter(
+    ax.scatter(
         orig_x, orig_y, orig_z,
         color=PLOT_COLORS['original_cloud'],
         s=22,
         alpha=0.3,
-        label='Original (reference)',
         depthshade=False,
     )
-    _add_legend_entry(legend_entries, handle, 'Original (reference)')
 
-    # 2. モデルに入力される可視ジョイント
     if unmasked_indices.size > 0:
-        handle = ax.scatter(
+        ax.scatter(
             mask_x[unmasked_indices],
             mask_y[unmasked_indices],
             mask_z[unmasked_indices],
             color=PLOT_COLORS['visible_joint'],
             s=55,
             alpha=0.85,
-            label='Observed joints',
             depthshade=False,
         )
-        _add_legend_entry(legend_entries, handle, 'Observed joints')
 
-    # 3. マスクされたジョイント（元位置を強調）
     if masked_ids.size > 0:
-        handle = ax.scatter(
+        ax.scatter(
             orig_x[masked_ids],
             orig_y[masked_ids],
             orig_z[masked_ids],
@@ -197,12 +796,9 @@ def plot_skeleton_visualization(original_data, masked_data, mask_indices, save_p
             edgecolor='k',
             linewidths=0.6,
             alpha=0.95,
-            label='Masked joints',
             depthshade=False,
         )
-        _add_legend_entry(legend_entries, handle, 'Masked joints')
 
-    # 骨格接続をプロット
     for edge in SKELETON_EDGES:
         if edge[0] < orig_frame.shape[0] and edge[1] < orig_frame.shape[0]:
             ax.plot(
@@ -222,10 +818,7 @@ def plot_skeleton_visualization(original_data, masked_data, mask_indices, save_p
                     linewidth=2.0,
                     alpha=0.75,
                 )
-    
-    ax.set_xlabel('X (down +)')
-    ax.set_ylabel('Y (left +)')
-    ax.set_zlabel('Z (forward +)')
+
     ax.set_title(title)
     ax.set_facecolor('#fbfbfb')
     ax.grid(False)
@@ -238,15 +831,9 @@ def plot_skeleton_visualization(original_data, masked_data, mask_indices, save_p
         margin=0.08,
     )
     set_camera_view(ax)
-    handles, labels = _unique_legend_entries(legend_entries)
-    ax.legend(handles, labels, frameon=False, bbox_to_anchor=(1.02, 1), loc='upper left')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
-    print(f"Visualization saved to {save_path}")
-    print(f"Masked joints: {masked_ids.tolist()}")
-
 
 
 def to_camera_coords(points):
@@ -325,7 +912,7 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
         loss: 損失値
         loss_dict: 損失の詳細情報
     """
-    batch_size = original.shape[0]
+    batch_size, seq_len, num_joints, _ = original.shape
     device = original.device
     
     # 損失関数の選択
@@ -368,46 +955,59 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
     # 全関節の損失を計算
     all_losses = loss_fn(reconstructed, original)  # [batch_size, seq_len, num_joints, 3]
     
-    # バッチごとに処理
-    masked_losses = []
-    unmasked_losses = []
+    # フレーム単位で集計
+    masked_loss_total = torch.tensor(0.0, device=device)
+    masked_elem_count = 0
+    unmasked_loss_total = torch.tensor(0.0, device=device)
+    unmasked_elem_count = 0
+    masked_joint_tally = 0
+    unmasked_joint_tally = 0
+    
+    total_frames = batch_size * seq_len
     
     for b in range(batch_size):
-        masked_joints = mask_indices[b]
-        if isinstance(masked_joints, torch.Tensor):
-            masked_joints = masked_joints.to(device)
-        else:
-            masked_joints = torch.tensor(masked_joints, device=device)
-        
-        # 全関節のインデックス
-        all_joints = torch.arange(original.shape[2], device=device)
-        unmasked_joints = all_joints[~torch.isin(all_joints, masked_joints)]
-        
-        # マスクされた関節の損失
-        if len(masked_joints) > 0:
-            masked_loss = all_losses[b, :, masked_joints, :].mean()
-            masked_losses.append(masked_loss)
-        
-        # マスクされていない関節の損失
-        if len(unmasked_joints) > 0:
-            unmasked_loss = all_losses[b, :, unmasked_joints, :].mean()
-            unmasked_losses.append(unmasked_loss)
+        for t in range(seq_len):
+            if mask_indices is None:
+                raw_mask = torch.empty(0, dtype=torch.long, device=device)
+            else:
+                try:
+                    raw_mask = mask_indices[b][t]
+                except (TypeError, IndexError):
+                    raw_mask = get_frame_mask_indices(mask_indices, sample_idx=b, frame_idx=t)
+            frame_mask = _ensure_long_tensor(raw_mask, device=device)
+            if frame_mask.numel() > 0:
+                frame_mask = torch.unique(frame_mask)
+            
+            mask_flags = torch.zeros(num_joints, dtype=torch.bool, device=device)
+            if frame_mask.numel() > 0:
+                mask_flags[frame_mask] = True
+                masked_slice = all_losses[b, t, frame_mask, :]
+                masked_loss_total = masked_loss_total + masked_slice.sum()
+                masked_elem_count += masked_slice.numel()
+                masked_joint_tally += frame_mask.numel()
+            
+            frame_unmasked = torch.arange(num_joints, device=device)[~mask_flags]
+            if frame_unmasked.numel() > 0:
+                unmasked_slice = all_losses[b, t, frame_unmasked, :]
+                unmasked_loss_total = unmasked_loss_total + unmasked_slice.sum()
+                unmasked_elem_count += unmasked_slice.numel()
+                unmasked_joint_tally += frame_unmasked.numel()
     
-    # 平均損失の計算
-    masked_avg_loss = torch.stack(masked_losses).mean() if masked_losses else torch.tensor(0.0, device=device)
-    unmasked_avg_loss = torch.stack(unmasked_losses).mean() if unmasked_losses else torch.tensor(0.0, device=device)
+    # 平均損失の計算（該当要素数で正規化）
+    masked_avg_loss = masked_loss_total / masked_elem_count if masked_elem_count > 0 else torch.tensor(0.0, device=device)
+    unmasked_avg_loss = unmasked_loss_total / unmasked_elem_count if unmasked_elem_count > 0 else torch.tensor(0.0, device=device)
     
     # 総損失
     total_loss = masked_avg_loss + unmasked_avg_loss
     
     # 統計情報
-    num_masked_joints = np.mean([len(mask_idx) for mask_idx in mask_indices]) if mask_indices else 0
-    num_unmasked_joints = original.shape[2] - num_masked_joints
+    avg_masked_joints = (masked_joint_tally / total_frames) if total_frames > 0 else 0.0
+    avg_unmasked_joints = (unmasked_joint_tally / total_frames) if total_frames > 0 else 0.0
     
     # 関節あたりの損失（正規化）
     total_loss_per_joint = total_loss.item() / original.shape[2]
-    masked_loss_per_joint = masked_avg_loss.item() / num_masked_joints if num_masked_joints > 0 else 0.0
-    unmasked_loss_per_joint = unmasked_avg_loss.item() / num_unmasked_joints if num_unmasked_joints > 0 else 0.0
+    masked_loss_per_joint = masked_avg_loss.item() / avg_masked_joints if avg_masked_joints > 0 else 0.0
+    unmasked_loss_per_joint = unmasked_avg_loss.item() / avg_unmasked_joints if avg_unmasked_joints > 0 else 0.0
     
     loss_dict = {
         'total_loss': total_loss.item(),
@@ -418,8 +1018,8 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
         'unmasked_joints_loss_mean': unmasked_avg_loss.item(),
         'unmasked_joints_loss_std': 0.0,  # 簡略化
         'unmasked_joints_loss_per_joint': unmasked_loss_per_joint,
-        'num_masked_joints': num_masked_joints,
-        'num_unmasked_joints': num_unmasked_joints,
+        'num_masked_joints': avg_masked_joints,
+        'num_unmasked_joints': avg_unmasked_joints,
     }
     
     return total_loss, loss_dict
@@ -493,19 +1093,13 @@ def calculate_joint_errors(original, reconstructed, mask_indices, device, sample
     original_sample = original[sample_idx]  # [seq_len, num_joints, 3]
     reconstructed_sample = reconstructed[sample_idx]  # [seq_len, num_joints, 3]
     sample_mask_indices = mask_indices[sample_idx]  # そのサンプルのマスクインデックス
+    masked_union = collapse_mask_indices(sample_mask_indices)
+    masked_joints_set = set(masked_union.tolist())
     
     # 全関節の誤差を計算
     joint_errors = []
     masked_joint_errors = []
     unmasked_joint_errors = []
-    
-    # マスクされた関節のセットを作成
-    masked_joints_set = set()
-    for masked_joint in sample_mask_indices:
-        if isinstance(masked_joint, torch.Tensor):
-            masked_joints_set.add(masked_joint.item())
-        else:
-            masked_joints_set.add(int(masked_joint))
     
     for joint_idx in range(num_joints):
         # 関節ごとの誤差を計算
@@ -531,9 +1125,9 @@ def calculate_joint_errors(original, reconstructed, mask_indices, device, sample
 
 def calculate_masked_unmasked_batch_errors(original, reconstructed, mask_indices):
     """
-    バッチ全体でのマスク/非マスク平均誤差を直感的に集計（1関節あたり）。
+    バッチ全体でのマスク/非マスク平均誤差をフレーム単位で集計（1関節あたり）。
     物理的距離（メートル）で計算。
-    - micro 平均: すべての関節-サンプルの実例で重み付け（頻度重み付き）
+    - micro 平均: すべての関節-フレームの実例で重み付け（頻度重み付き）
     - macro 平均: 関節ごとの平均を取ってからジョイントで平均（関節ごと等重み）
     さらに、関節ごとの平均誤差とサンプル数も返す。
     
@@ -555,27 +1149,38 @@ def calculate_masked_unmasked_batch_errors(original, reconstructed, mask_indices
     B, T, V, _ = original.shape
     # [B, T, V] - 物理的距離（メートル）
     distances = torch.norm(original - reconstructed, dim=-1)
-    # 時系列平均 -> [B, V]
-    per_sample_joint = distances.mean(dim=1).cpu().numpy()
-    # マスク集合（各サンプルごとに set）
-    masked_sets = []
-    for b in range(B):
-        ms = set(int(j.item()) if isinstance(j, torch.Tensor) else int(j) for j in mask_indices[b])
-        masked_sets.append(ms)
+    
     # 関節ごとに値を収集
     per_joint_masked_vals = [[] for _ in range(V)]
     per_joint_unmasked_vals = [[] for _ in range(V)]
     total_masked_instances = 0
     total_unmasked_instances = 0
     for b in range(B):
-        for v in range(V):
-            val = float(per_sample_joint[b, v])
-            if v in masked_sets[b]:
-                per_joint_masked_vals[v].append(val)
-                total_masked_instances += 1
+        for t in range(T):
+            if mask_indices is None:
+                raw_mask = torch.empty(0, dtype=torch.long, device=distances.device)
             else:
-                per_joint_unmasked_vals[v].append(val)
-                total_unmasked_instances += 1
+                try:
+                    raw_mask = mask_indices[b][t]
+                except (TypeError, IndexError):
+                    raw_mask = get_frame_mask_indices(mask_indices, sample_idx=b, frame_idx=t)
+            frame_mask = _ensure_long_tensor(raw_mask, device=distances.device)
+            if frame_mask.numel() > 0:
+                frame_mask = torch.unique(frame_mask)
+            
+            mask_flags = torch.zeros(V, dtype=torch.bool, device=distances.device)
+            if frame_mask.numel() > 0:
+                mask_flags[frame_mask] = True
+            
+            frame_dist = distances[b, t].detach().cpu().numpy()
+            for v in range(V):
+                val = float(frame_dist[v])
+                if mask_flags[v]:
+                    per_joint_masked_vals[v].append(val)
+                    total_masked_instances += 1
+                else:
+                    per_joint_unmasked_vals[v].append(val)
+                    total_unmasked_instances += 1
     # per-joint mean と count
     per_joint_masked_mean = np.array([np.mean(x) if len(x) > 0 else np.nan for x in per_joint_masked_vals])
     per_joint_unmasked_mean = np.array([np.mean(x) if len(x) > 0 else np.nan for x in per_joint_unmasked_vals])
@@ -588,8 +1193,8 @@ def calculate_masked_unmasked_batch_errors(original, reconstructed, mask_indices
     macro_masked_mean = float(np.nanmean(per_joint_masked_mean)) if np.any(~np.isnan(per_joint_masked_mean)) else 0.0
     macro_unmasked_mean = float(np.nanmean(per_joint_unmasked_mean)) if np.any(~np.isnan(per_joint_unmasked_mean)) else 0.0
     # カバレッジ情報
-    avg_masked_per_sample = total_masked_instances / float(B)
-    mask_rate = total_masked_instances / float(B * V)
+    avg_masked_per_sample = total_masked_instances / float(B * T)
+    mask_rate = total_masked_instances / float(B * T * V)
     return {
         'micro_masked_mean': micro_masked_mean,
         'micro_unmasked_mean': micro_unmasked_mean,
@@ -688,9 +1293,9 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
     fixed_masked, fixed_mask_indices = mask_skeleton_joints(
         fixed_batch, mask_ratio=mask_ratio, mask_token=model.mask_token
     )
+    fixed_union = [collapse_mask_indices(mask_idx) for mask_idx in fixed_mask_indices]
     print(f"Fixed batch for reconstruction tracking: {fixed_batch.shape}")
-    print(f"Fixed masked joints count per sample: {[len(mask_idx) for mask_idx in fixed_mask_indices]}")
-    print(f"Fixed masked joint indices: {[mask_idx.tolist() for mask_idx in fixed_mask_indices]}")
+    print(f"Fixed masked joint indices: {fixed_mask_indices}")
     print(f"Mask ratio: {mask_ratio:.1%} (expected: {int(22 * mask_ratio)} joints per sample)")
     
     # 再構成変化の履歴を保存
@@ -710,7 +1315,7 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
             
             # マスキング
             masked_batch, mask_indices = mask_skeleton_joints(
-                batch, mask_ratio=mask_ratio, mask_token=model.mask_token
+                batch, mask_ratio=mask_ratio, mask_token=model.mask_token, batch_idx=batch_idx
             )
 
             # マスクされた座標から再構成
@@ -1016,876 +1621,216 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
             save_path=f"{save_dir}/sequence_reconstruction_overlay.png",
             overlay=True
         )
+        plot_sequence_mask_overview(
+            test_batch.cpu(),
+            test_mask_indices,
+            save_path=f"{save_dir}/sequence_mask_overview.png",
+            sample_idx=0,
+        )
     
     return model, training_history
 
 
 def plot_reconstruction_comparison(original_data, masked_data, reconstructed_data, mask_indices, save_path, overlay=False):
-    """
-    再構成結果の比較可視化（元データ、マスクデータ、再構成データ）
-    
-    Args:
-        original_data: 元のスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        masked_data: マスクされたスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        reconstructed_data: 再構成されたスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        mask_indices: マスクされた関節のインデックス
-        save_path: 保存パス
-        overlay: Trueの場合、同じ座標に重ねて表示
-    """
-    # 最初のバッチの全フレームを取得
-    orig_sequence = to_numpy_array(original_data[0])  # [seq_len, num_joints, 3]
+    """再構成結果の比較可視化"""
+    orig_sequence = to_numpy_array(original_data[0])
     mask_sequence = to_numpy_array(masked_data[0])
     recon_sequence = to_numpy_array(reconstructed_data[0])
-    masked_ids = to_numpy_indices(mask_indices[0])
+
+    masked_ids = get_frame_mask_numpy(mask_indices, sample_idx=0, frame_idx=0)
     masked_ids = np.sort(masked_ids)
-    
-    # 最初のフレームのみを取得（既存の表示用）
-    orig_frame = orig_sequence[0]  # [num_joints, 3]
+
+    orig_frame = orig_sequence[0]
     mask_frame = mask_sequence[0]
     recon_frame = recon_sequence[0]
-    
-    # 座標変換（カメラ座標系: X下+, Y左+, Z奥+）
-    orig_x, orig_y, orig_z = to_camera_coords(orig_frame)
-    mask_x_raw, mask_y_raw, mask_z_raw = to_camera_coords(mask_frame)
-    recon_x, recon_y, recon_z = to_camera_coords(recon_frame)
 
-    mask_x = mask_x_raw.copy()
-    mask_y = mask_y_raw.copy()
-    mask_z = mask_z_raw.copy()
-    if masked_ids.size > 0:
-        mask_x[masked_ids] = orig_x[masked_ids]
-        mask_y[masked_ids] = orig_y[masked_ids]
-        mask_z[masked_ids] = orig_z[masked_ids]
+    orig_coords = tuple(to_camera_coords(orig_frame))
+    mask_coords_raw = tuple(to_camera_coords(mask_frame))
+    recon_coords = tuple(to_camera_coords(recon_frame))
+    mask_coords = _mask_observed_coords(mask_coords_raw, orig_coords, masked_ids)
 
     joint_idx = np.arange(orig_frame.shape[0])
-    unmasked_mask = ~np.isin(joint_idx, masked_ids)
-    unmasked_indices = joint_idx[unmasked_mask]
-    unmasked_set = set(unmasked_indices.tolist())
+    unmasked_ids = np.setdiff1d(joint_idx, masked_ids)
 
     if overlay:
-        # 重ねて表示
         fig = plt.figure(figsize=(9, 7))
         ax = fig.add_subplot(111, projection='3d')
-        ax.set_facecolor('#fbfbfb')
-        ax.grid(False)
-        
-        # 元のスケルトン（薄い青）
-        legend_entries = []
-
-        handle = ax.scatter(
-            orig_x,
-            orig_y,
-            orig_z,
-            color=PLOT_COLORS['original_cloud'],
-            s=22,
-            alpha=0.3,
-            label='Original (reference)',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Original (reference)')
-
-        # 観測済みジョイント
-        if unmasked_indices.size > 0:
-            handle = ax.scatter(
-                mask_x[unmasked_indices],
-                mask_y[unmasked_indices],
-                mask_z[unmasked_indices],
-                color=PLOT_COLORS['visible_joint'],
-                s=55,
-                alpha=0.9,
-                label='Observed joints',
-                depthshade=False,
-            )
-            _add_legend_entry(legend_entries, handle, 'Observed joints')
-
-        if masked_ids.size > 0:
-            # マスクトークン位置（参考）
-            handle = ax.scatter(
-                mask_x_raw[masked_ids],
-                mask_y_raw[masked_ids],
-                mask_z_raw[masked_ids],
-                color=PLOT_COLORS['masked_placeholder'],
-                s=40,
-                marker='x',
-                linewidths=1.1,
-                alpha=0.75,
-                label='Mask token',
-                depthshade=False,
-            )
-            _add_legend_entry(legend_entries, handle, 'Mask token')
-
-            # 元の位置
-            handle = ax.scatter(
-                orig_x[masked_ids],
-                orig_y[masked_ids],
-                orig_z[masked_ids],
-                color=PLOT_COLORS['masked_joint'],
-                s=80,
-                marker='o',
-                edgecolor='k',
-                linewidths=0.6,
-                alpha=0.9,
-                label='Masked (original)',
-                depthshade=False,
-            )
-            _add_legend_entry(legend_entries, handle, 'Masked (original)')
-
-            # 再構成位置
-            handle = ax.scatter(
-                recon_x[masked_ids],
-                recon_y[masked_ids],
-                recon_z[masked_ids],
-                color=PLOT_COLORS['masked_joint'],
-                s=90,
-                marker='^',
-                edgecolor='k',
-                linewidths=0.6,
-                alpha=0.9,
-                label='Masked (reconstructed)',
-                depthshade=False,
-            )
-            _add_legend_entry(legend_entries, handle, 'Masked (reconstructed)')
-
-            for idx in masked_ids:
-                ax.plot(
-                    [orig_x[idx], recon_x[idx]],
-                    [orig_y[idx], recon_y[idx]],
-                    [orig_z[idx], recon_z[idx]],
-                    color='#7f7f7f',
-                    linestyle='--',
-                    linewidth=1.0,
-                    alpha=0.75,
-                )
-
-        # 再構成されたジョイント（観測可能なもの）
-        if unmasked_indices.size > 0:
-            handle = ax.scatter(
-                recon_x[unmasked_indices],
-                recon_y[unmasked_indices],
-                recon_z[unmasked_indices],
-                color=PLOT_COLORS['reconstructed_joint'],
-                s=55,
-                alpha=0.8,
-                label='Reconstructed (visible)',
-                depthshade=False,
-            )
-            _add_legend_entry(legend_entries, handle, 'Reconstructed (visible)')
-
-        # 骨格
-        for edge in SKELETON_EDGES:
-            if edge[0] < orig_frame.shape[0] and edge[1] < orig_frame.shape[0]:
-                ax.plot(
-                    [orig_x[edge[0]], orig_x[edge[1]]],
-                    [orig_y[edge[0]], orig_y[edge[1]]],
-                    [orig_z[edge[0]], orig_z[edge[1]]],
-                    color=PLOT_COLORS['original_edge'],
-                    linewidth=1.1,
-                    alpha=0.35,
-                )
-            if edge[0] < mask_frame.shape[0] and edge[1] < mask_frame.shape[0]:
-                if edge[0] in unmasked_set and edge[1] in unmasked_set:
-                    ax.plot(
-                        [mask_x[edge[0]], mask_x[edge[1]]],
-                        [mask_y[edge[0]], mask_y[edge[1]]],
-                        [mask_z[edge[0]], mask_z[edge[1]]],
-                        color=PLOT_COLORS['visible_edge'],
-                        linewidth=2.0,
-                        alpha=0.8,
-                    )
-            if edge[0] < recon_frame.shape[0] and edge[1] < recon_frame.shape[0]:
-                ax.plot(
-                    [recon_x[edge[0]], recon_x[edge[1]]],
-                    [recon_y[edge[0]], recon_y[edge[1]]],
-                    [recon_z[edge[0]], recon_z[edge[1]]],
-                    color=PLOT_COLORS['reconstructed_edge'],
-                    linewidth=1.8,
-                    alpha=0.75,
-                )
-
-        ax.set_xlabel('X (down +)')
-        ax.set_ylabel('Y (left +)')
-        ax.set_zlabel('Z (forward +)')
-        ax.set_title('Skeleton Reconstruction Comparison (Overlay)')
-        set_axes_equal(
+        _draw_overlay_view(
             ax,
-            [orig_x, mask_x, recon_x, mask_x_raw[masked_ids]],
-            [orig_y, mask_y, recon_y, mask_y_raw[masked_ids]],
-            [orig_z, mask_z, recon_z, mask_z_raw[masked_ids]],
-            margin=0.08,
+            orig_coords,
+            mask_coords,
+            mask_coords_raw,
+            recon_coords,
+            masked_ids,
+            unmasked_ids,
+            title='Skeleton Reconstruction Comparison (Overlay)',
         )
-        set_camera_view(ax)
-        handles, labels = _unique_legend_entries(legend_entries)
-        ax.legend(handles, labels, frameon=False, bbox_to_anchor=(1.02, 1), loc='upper left')
-        
-        plt.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+        plt.tight_layout(rect=[0.0, 0.0, 0.9, 1.0])
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        print(f"Reconstruction comparison saved to {save_path}")
         return
-    
-    # 分離表示
-    fig = plt.figure(figsize=(16, 5))
-    legend_entries = []
 
-    # 1. 元のスケルトン
-    ax1 = fig.add_subplot(131, projection='3d')
-    ax1.set_facecolor('#fbfbfb')
-    ax1.grid(False)
-    handle = ax1.scatter(
-        orig_x,
-        orig_y,
-        orig_z,
-        color=PLOT_COLORS['original_cloud'],
-        s=22,
-        alpha=0.3,
-        label='Original (reference)',
-        depthshade=False,
-    )
-    _add_legend_entry(legend_entries, handle, 'Original (reference)')
-    if masked_ids.size > 0:
-        handle = ax1.scatter(
-            orig_x[masked_ids],
-            orig_y[masked_ids],
-            orig_z[masked_ids],
-            color=PLOT_COLORS['masked_joint'],
-            s=85,
-            marker='o',
-            edgecolor='k',
-            linewidths=0.6,
-            alpha=0.95,
-            label='Masked joints',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Masked joints')
-    for edge in SKELETON_EDGES:
-        if edge[0] < orig_frame.shape[0] and edge[1] < orig_frame.shape[0]:
-            ax1.plot(
-                [orig_x[edge[0]], orig_x[edge[1]]],
-                [orig_y[edge[0]], orig_y[edge[1]]],
-                [orig_z[edge[0]], orig_z[edge[1]]],
-                color=PLOT_COLORS['original_edge'],
-                linewidth=1.3,
-                alpha=0.5,
-            )
+    fig = plt.figure(figsize=(22, 5))
 
-    ax1.set_xlabel('X (down +)')
-    ax1.set_ylabel('Y (left +)')
-    ax1.set_zlabel('Z (forward +)')
-    ax1.set_title('Original Skeleton')
-    set_axes_equal(
-        ax1,
-        [orig_x],
-        [orig_y],
-        [orig_z],
-        margin=0.08,
-    )
-    set_camera_view(ax1)
+    ax1 = fig.add_subplot(141, projection='3d')
+    _draw_original_view(ax1, orig_coords, title='Original')
 
-    # 2. マスクされたスケルトン
-    ax2 = fig.add_subplot(132, projection='3d')
-    ax2.set_facecolor('#fbfbfb')
-    ax2.grid(False)
-
-    if unmasked_indices.size > 0:
-        handle = ax2.scatter(
-            mask_x[unmasked_indices],
-            mask_y[unmasked_indices],
-            mask_z[unmasked_indices],
-            color=PLOT_COLORS['visible_joint'],
-            s=55,
-            alpha=0.9,
-            label='Observed joints',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Observed joints')
-    if masked_ids.size > 0:
-        handle = ax2.scatter(
-            mask_x_raw[masked_ids],
-            mask_y_raw[masked_ids],
-            mask_z_raw[masked_ids],
-            color=PLOT_COLORS['masked_placeholder'],
-            s=40,
-            marker='x',
-            linewidths=1.2,
-            alpha=0.75,
-            label='Mask token',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Mask token')
-        handle = ax2.scatter(
-            orig_x[masked_ids],
-            orig_y[masked_ids],
-            orig_z[masked_ids],
-            color=PLOT_COLORS['masked_joint'],
-            s=85,
-            marker='o',
-            edgecolor='k',
-            linewidths=0.6,
-            alpha=0.95,
-            label='Masked (original)',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Masked (original)')
-    for edge in SKELETON_EDGES:
-        if edge[0] in unmasked_set and edge[1] in unmasked_set:
-            ax2.plot(
-                [mask_x[edge[0]], mask_x[edge[1]]],
-                [mask_y[edge[0]], mask_y[edge[1]]],
-                [mask_z[edge[0]], mask_z[edge[1]]],
-                color=PLOT_COLORS['visible_edge'],
-                linewidth=2.0,
-                alpha=0.8,
-            )
-
-    ax2.set_xlabel('X (down +)')
-    ax2.set_ylabel('Y (left +)')
-    ax2.set_zlabel('Z (forward +)')
-    ax2.set_title(f'Masked Skeleton (masked joints: {masked_ids.tolist()})')
-    set_axes_equal(
+    ax2 = fig.add_subplot(142, projection='3d')
+    _draw_mask_view(
         ax2,
-        [mask_x, mask_x_raw[masked_ids]],
-        [mask_y, mask_y_raw[masked_ids]],
-        [mask_z, mask_z_raw[masked_ids]],
-        margin=0.08,
+        orig_coords,
+        mask_coords,
+        mask_coords_raw,
+        masked_ids,
+        unmasked_ids,
+        title='Masked (annotated)',
     )
-    set_camera_view(ax2)
 
-    # 3. 再構成されたスケルトン
-    ax3 = fig.add_subplot(133, projection='3d')
-    ax3.set_facecolor('#fbfbfb')
-    ax3.grid(False)
-    if unmasked_indices.size > 0:
-        handle = ax3.scatter(
-            recon_x[unmasked_indices],
-            recon_y[unmasked_indices],
-            recon_z[unmasked_indices],
-            color=PLOT_COLORS['reconstructed_joint'],
-            s=55,
-            alpha=0.85,
-            label='Reconstructed (visible)',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Reconstructed (visible)')
-    if masked_ids.size > 0:
-        handle = ax3.scatter(
-            recon_x[masked_ids],
-            recon_y[masked_ids],
-            recon_z[masked_ids],
-            color=PLOT_COLORS['masked_joint'],
-            s=90,
-            marker='^',
-            edgecolor='k',
-            linewidths=0.6,
-            alpha=0.95,
-            label='Reconstructed (masked)',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Reconstructed (masked)')
-        handle = ax3.scatter(
-            orig_x[masked_ids],
-            orig_y[masked_ids],
-            orig_z[masked_ids],
-            facecolor='none',
-            edgecolor=PLOT_COLORS['masked_joint'],
-            s=95,
-            marker='o',
-            linewidths=1.2,
-            alpha=0.9,
-            label='Masked (original)',
-            depthshade=False,
-        )
-        _add_legend_entry(legend_entries, handle, 'Masked (original)')
-        for idx in masked_ids:
-            ax3.plot(
-                [orig_x[idx], recon_x[idx]],
-                [orig_y[idx], recon_y[idx]],
-                [orig_z[idx], recon_z[idx]],
-                color='#7f7f7f',
-                linestyle='--',
-                linewidth=1.0,
-                alpha=0.75,
-            )
-    for edge in SKELETON_EDGES:
-        if edge[0] < recon_frame.shape[0] and edge[1] < recon_frame.shape[0]:
-            ax3.plot(
-                [recon_x[edge[0]], recon_x[edge[1]]],
-                [recon_y[edge[0]], recon_y[edge[1]]],
-                [recon_z[edge[0]], recon_z[edge[1]]],
-                color=PLOT_COLORS['reconstructed_edge'],
-                linewidth=1.8,
-                alpha=0.75,
-            )
+    ax3 = fig.add_subplot(143, projection='3d')
+    _draw_reconstructed_plain_view(ax3, recon_coords, title='Reconstructed')
 
-    ax3.set_xlabel('X (down +)')
-    ax3.set_ylabel('Y (left +)')
-    ax3.set_zlabel('Z (forward +)')
-    ax3.set_title('Reconstructed Skeleton')
-    set_axes_equal(
-        ax3,
-        [recon_x, orig_x[masked_ids]],
-        [recon_y, orig_y[masked_ids]],
-        [recon_z, orig_z[masked_ids]],
-        margin=0.08,
+    ax4 = fig.add_subplot(144, projection='3d')
+    _draw_reconstructed_error_view(
+        ax4,
+        orig_coords,
+        recon_coords,
+        masked_ids,
+        unmasked_ids,
+        title='Reconstructed (error view)',
     )
-    set_camera_view(ax3)
-    handles, labels = _unique_legend_entries(legend_entries)
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc='upper center',
-            bbox_to_anchor=(0.5, 1.02),
-            frameon=False,
-            ncol=min(3, len(labels)),
-        )
-    
-    plt.tight_layout()
+
+    plt.tight_layout(w_pad=1.2)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
     print(f"Reconstruction comparison saved to {save_path}")
 
 
 def plot_sequence_reconstruction_comparison(original_data, masked_data, reconstructed_data, mask_indices, save_path, overlay=False):
-    """
-    9フレームシーケンス全体の再構成結果比較可視化
-    
-    Args:
-        original_data: 元のスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        masked_data: マスクされたスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        reconstructed_data: 再構成されたスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        mask_indices: マスクされた関節のインデックス
-        save_path: 保存パス
-        overlay: Trueの場合、同じ座標に重ねて表示
-    """
-    # 最初のバッチの全フレームを取得
-    orig_sequence = to_numpy_array(original_data[0])  # [seq_len, num_joints, 3]
+    """9フレームシーケンス全体の再構成結果比較可視化"""
+    orig_sequence = to_numpy_array(original_data[0])
     mask_sequence = to_numpy_array(masked_data[0])
     recon_sequence = to_numpy_array(reconstructed_data[0])
-    masked_ids = to_numpy_indices(mask_indices[0])
-    masked_ids = np.sort(masked_ids)
-    
+
     seq_len = orig_sequence.shape[0]
-    num_joints = orig_sequence.shape[1]
+    joint_idx = np.arange(orig_sequence.shape[1])
 
-    joint_idx = np.arange(num_joints)
-    unmasked_mask = ~np.isin(joint_idx, masked_ids)
-    unmasked_indices = joint_idx[unmasked_mask]
-    unmasked_set = set(unmasked_indices.tolist())
-    
+    masked_indices_per_frame = []
+    unmasked_indices_per_frame = []
+    orig_coords_list = []
+    mask_coords_raw_list = []
+    mask_coords_list = []
+    recon_coords_list = []
+
+    for frame_idx in range(seq_len):
+        masked_ids = get_frame_mask_numpy(mask_indices, sample_idx=0, frame_idx=frame_idx)
+        masked_ids = np.sort(masked_ids)
+        masked_indices_per_frame.append(masked_ids)
+        unmasked_ids = np.setdiff1d(joint_idx, masked_ids)
+        unmasked_indices_per_frame.append(unmasked_ids)
+
+        orig_coords = tuple(to_camera_coords(orig_sequence[frame_idx]))
+        mask_coords_raw = tuple(to_camera_coords(mask_sequence[frame_idx]))
+        recon_coords = tuple(to_camera_coords(recon_sequence[frame_idx]))
+        mask_coords = _mask_observed_coords(mask_coords_raw, orig_coords, masked_ids)
+
+        orig_coords_list.append(orig_coords)
+        mask_coords_raw_list.append(mask_coords_raw)
+        mask_coords_list.append(mask_coords)
+        recon_coords_list.append(recon_coords)
+
     if overlay:
-        # 重ねて表示: 3x3グリッドで9フレームを表示
-        fig = plt.figure(figsize=(14, 14))
-        legend_entries = []
-        
+        fig = plt.figure(figsize=(4 * seq_len, 4.5))
         for frame_idx in range(seq_len):
-            ax = fig.add_subplot(3, 3, frame_idx + 1, projection='3d')
-            ax.set_facecolor('#fbfbfb')
-            ax.grid(False)
-            
-            # 現在のフレームのデータ
-            orig_frame = orig_sequence[frame_idx]
-            mask_frame = mask_sequence[frame_idx]
-            recon_frame = recon_sequence[frame_idx]
-            
-            # 座標変換（カメラ座標系）
-            orig_x, orig_y, orig_z = to_camera_coords(orig_frame)
-            mask_x_raw, mask_y_raw, mask_z_raw = to_camera_coords(mask_frame)
-            recon_x, recon_y, recon_z = to_camera_coords(recon_frame)
-            mask_x = mask_x_raw.copy()
-            mask_y = mask_y_raw.copy()
-            mask_z = mask_z_raw.copy()
-            if masked_ids.size > 0:
-                mask_x[masked_ids] = orig_x[masked_ids]
-                mask_y[masked_ids] = orig_y[masked_ids]
-                mask_z[masked_ids] = orig_z[masked_ids]
-            
-            # 元のスケルトン（薄い青）
-            label = 'Original (reference)' if frame_idx == 0 else None
-            handle = ax.scatter(
-                orig_x,
-                orig_y,
-                orig_z,
-                color=PLOT_COLORS['original_cloud'],
-                s=18,
-                alpha=0.28,
-                label=label,
-                depthshade=False,
-            )
-            if frame_idx == 0:
-                _add_legend_entry(legend_entries, handle, label)
-            
-            # 観測済みジョイント
-            if unmasked_indices.size > 0:
-                label = 'Observed joints' if frame_idx == 0 else None
-                handle = ax.scatter(
-                    mask_x[unmasked_indices],
-                    mask_y[unmasked_indices],
-                    mask_z[unmasked_indices],
-                    color=PLOT_COLORS['visible_joint'],
-                    s=50,
-                    alpha=0.9,
-                    label=label,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, label)
-            
-            # マスクされた関節（赤いX）
-            if masked_ids.size > 0:
-                label = 'Mask token' if frame_idx == 0 else None
-                handle = ax.scatter(
-                    mask_x_raw[masked_ids],
-                    mask_y_raw[masked_ids],
-                    mask_z_raw[masked_ids],
-                    color=PLOT_COLORS['masked_placeholder'],
-                    s=36,
-                    marker='x',
-                    linewidths=1.0,
-                    alpha=0.7,
-                    label=label,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, label)
-                label = 'Masked (original)' if frame_idx == 0 else None
-                handle = ax.scatter(
-                    orig_x[masked_ids],
-                    orig_y[masked_ids],
-                    orig_z[masked_ids],
-                    color=PLOT_COLORS['masked_joint'],
-                    s=65,
-                    marker='o',
-                    edgecolor='k',
-                    linewidths=0.5,
-                    alpha=0.95,
-                    label=label,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, label)
-                label = 'Masked (reconstructed)' if frame_idx == 0 else None
-                handle = ax.scatter(
-                    recon_x[masked_ids],
-                    recon_y[masked_ids],
-                    recon_z[masked_ids],
-                    color=PLOT_COLORS['masked_joint'],
-                    s=70,
-                    marker='^',
-                    edgecolor='k',
-                    linewidths=0.5,
-                    alpha=0.95,
-                    label=label,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, label)
-                for idx in masked_ids:
-                    ax.plot(
-                        [orig_x[idx], recon_x[idx]],
-                        [orig_y[idx], recon_y[idx]],
-                        [orig_z[idx], recon_z[idx]],
-                        color='#7f7f7f',
-                        linestyle='--',
-                        linewidth=0.9,
-                        alpha=0.7,
-                    )
-            
-            # 再構成された関節（緑）
-            if unmasked_indices.size > 0:
-                label = 'Reconstructed (visible)' if frame_idx == 0 else None
-                handle = ax.scatter(
-                    recon_x[unmasked_indices],
-                    recon_y[unmasked_indices],
-                    recon_z[unmasked_indices],
-                    color=PLOT_COLORS['reconstructed_joint'],
-                    s=50,
-                    alpha=0.85,
-                    label=label,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, label)
-            
-            # 骨格をプロット（再構成データ）
-            for edge in SKELETON_EDGES:
-                if edge[0] < num_joints and edge[1] < num_joints:
-                    ax.plot(
-                        [orig_x[edge[0]], orig_x[edge[1]]],
-                        [orig_y[edge[0]], orig_y[edge[1]]],
-                        [orig_z[edge[0]], orig_z[edge[1]]],
-                        color=PLOT_COLORS['original_edge'],
-                        linewidth=0.9,
-                        alpha=0.35,
-                    )
-                    if edge[0] in unmasked_set and edge[1] in unmasked_set:
-                        ax.plot(
-                            [mask_x[edge[0]], mask_x[edge[1]]],
-                            [mask_y[edge[0]], mask_y[edge[1]]],
-                            [mask_z[edge[0]], mask_z[edge[1]]],
-                            color=PLOT_COLORS['visible_edge'],
-                            linewidth=1.4,
-                            alpha=0.75,
-                        )
-                    ax.plot(
-                        [recon_x[edge[0]], recon_x[edge[1]]],
-                        [recon_y[edge[0]], recon_y[edge[1]]],
-                        [recon_z[edge[0]], recon_z[edge[1]]],
-                        color=PLOT_COLORS['reconstructed_edge'],
-                        linewidth=1.5,
-                        alpha=0.75,
-                    )
-            
-            # 軸設定
-            ax.set_xlabel('X (down +)')
-            ax.set_ylabel('Y (left +)')
-            ax.set_zlabel('Z (forward +)')
-            ax.set_title(f'Frame {frame_idx + 1}')
-            
-            set_axes_equal(
+            ax = fig.add_subplot(1, seq_len, frame_idx + 1, projection='3d')
+            _draw_mask_view(
                 ax,
-                [orig_x, mask_x, recon_x, mask_x_raw[masked_ids]],
-                [orig_y, mask_y, recon_y, mask_y_raw[masked_ids]],
-                [orig_z, mask_z, recon_z, mask_z_raw[masked_ids]],
-                margin=0.08,
+                orig_coords_list[frame_idx],
+                mask_coords_list[frame_idx],
+                mask_coords_raw_list[frame_idx],
+                masked_indices_per_frame[frame_idx],
+                unmasked_indices_per_frame[frame_idx],
+                title=f'Mask info F{frame_idx + 1}',
+                visible_size=45,
+                masked_size=70,
+                token_size=35,
+                visible_edge_width=1.5,
+                masked_edge_width=1.8,
             )
-            set_camera_view(ax)
-            
-            if frame_idx == 0:
-                handles, labels = _unique_legend_entries(legend_entries)
-                ax.legend(handles, labels, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, frameon=False)
-    
-    else:
-        # 分離表示: 3x3グリッドで9フレームを表示
-        fig = plt.figure(figsize=(20, 15))
-        legend_entries = []
-        
-        for frame_idx in range(seq_len):
-            # 元データ
-            ax1 = fig.add_subplot(3, 9, frame_idx * 3 + 1, projection='3d')
-            orig_frame = orig_sequence[frame_idx]
-            orig_x, orig_y, orig_z = to_camera_coords(orig_frame)
-            ax1.set_facecolor('#fbfbfb')
-            ax1.grid(False)
-            
-            if frame_idx == 0:
-                label = 'Original (reference)'
-            else:
-                label = None
-            handle = ax1.scatter(
-                orig_x,
-                orig_y,
-                orig_z,
-                color=PLOT_COLORS['original_cloud'],
-                s=22,
-                alpha=0.3,
-                label=label,
-                depthshade=False,
-            )
-            if frame_idx == 0:
-                _add_legend_entry(legend_entries, handle, label)
-            if masked_ids.size > 0:
-                handle = ax1.scatter(
-                    orig_x[masked_ids],
-                    orig_y[masked_ids],
-                    orig_z[masked_ids],
-                    color=PLOT_COLORS['masked_joint'],
-                    s=75,
-                    marker='o',
-                    edgecolor='k',
-                    linewidths=0.5,
-                    alpha=0.95,
-                    label='Masked joints' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, 'Masked joints')
-            for edge in SKELETON_EDGES:
-                if edge[0] < num_joints and edge[1] < num_joints:
-                    ax1.plot(
-                        [orig_x[edge[0]], orig_x[edge[1]]],
-                        [orig_y[edge[0]], orig_y[edge[1]]],
-                        [orig_z[edge[0]], orig_z[edge[1]]],
-                        color=PLOT_COLORS['original_edge'],
-                        linewidth=1.2,
-                        alpha=0.45,
-                    )
-            
-            ax1.set_title(f'Original F{frame_idx+1}')
-            ax1.set_xlabel('X (down +)')
-            ax1.set_ylabel('Y (left +)')
-            ax1.set_zlabel('Z (forward +)')
-            set_axes_equal(
-                ax1,
-                [orig_x],
-                [orig_y],
-                [orig_z],
-                margin=0.08,
-            )
-            set_camera_view(ax1)
-            
-            # マスクデータ
-            ax2 = fig.add_subplot(3, 9, frame_idx * 3 + 2, projection='3d')
-            mask_frame = mask_sequence[frame_idx]
-            mask_x_raw, mask_y_raw, mask_z_raw = to_camera_coords(mask_frame)
-            ax2.set_facecolor('#fbfbfb')
-            ax2.grid(False)
-            mask_x = mask_x_raw.copy()
-            mask_y = mask_y_raw.copy()
-            mask_z = mask_z_raw.copy()
-            if masked_ids.size > 0:
-                mask_x[masked_ids] = orig_x[masked_ids]
-                mask_y[masked_ids] = orig_y[masked_ids]
-                mask_z[masked_ids] = orig_z[masked_ids]
-            
-            if unmasked_indices.size > 0:
-                handle = ax2.scatter(
-                    mask_x[unmasked_indices],
-                    mask_y[unmasked_indices],
-                    mask_z[unmasked_indices],
-                    color=PLOT_COLORS['visible_joint'],
-                    s=40,
-                    alpha=0.9,
-                    label='Observed' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, 'Observed')
-            if masked_ids.size > 0:
-                handle = ax2.scatter(
-                    mask_x_raw[masked_ids],
-                    mask_y_raw[masked_ids],
-                    mask_z_raw[masked_ids],
-                    color=PLOT_COLORS['masked_placeholder'],
-                    s=38,
-                    marker='x',
-                    linewidths=1.0,
-                    alpha=0.7,
-                    label='Mask token' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-                if frame_idx == 0:
-                    _add_legend_entry(legend_entries, handle, 'Mask token')
-                ax2.scatter(
-                    orig_x[masked_ids],
-                    orig_y[masked_ids],
-                    orig_z[masked_ids],
-                    color=PLOT_COLORS['masked_joint'],
-                    s=80,
-                    marker='o',
-                    edgecolor='k',
-                    linewidths=0.5,
-                    alpha=0.95,
-                    label='Masked (orig)' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-            for edge in SKELETON_EDGES:
-                if edge[0] in unmasked_set and edge[1] in unmasked_set:
-                    ax2.plot(
-                        [mask_x[edge[0]], mask_x[edge[1]]],
-                        [mask_y[edge[0]], mask_y[edge[1]]],
-                        [mask_z[edge[0]], mask_z[edge[1]]],
-                        color=PLOT_COLORS['visible_edge'],
-                        linewidth=1.6,
-                        alpha=0.8,
-                    )
-            
-            ax2.set_title(f'Masked F{frame_idx+1}')
-            ax2.set_xlabel('X (down +)')
-            ax2.set_ylabel('Y (left +)')
-            ax2.set_zlabel('Z (forward +)')
-            set_axes_equal(
-                ax2,
-                [mask_x, mask_x_raw[masked_ids]],
-                [mask_y, mask_y_raw[masked_ids]],
-                [mask_z, mask_z_raw[masked_ids]],
-                margin=0.08,
-            )
-            set_camera_view(ax2)
-            
-            # 再構成データ
-            ax3 = fig.add_subplot(3, 9, frame_idx * 3 + 3, projection='3d')
-            recon_frame = recon_sequence[frame_idx]
-            recon_x, recon_y, recon_z = to_camera_coords(recon_frame)
-            ax3.set_facecolor('#fbfbfb')
-            ax3.grid(False)
-            if unmasked_indices.size > 0:
-                ax3.scatter(
-                    recon_x[unmasked_indices],
-                    recon_y[unmasked_indices],
-                    recon_z[unmasked_indices],
-                    color=PLOT_COLORS['reconstructed_joint'],
-                    s=35,
-                    alpha=0.9,
-                    label='Reconstructed' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-            if masked_ids.size > 0:
-                ax3.scatter(
-                    recon_x[masked_ids],
-                    recon_y[masked_ids],
-                    recon_z[masked_ids],
-                    color=PLOT_COLORS['masked_joint'],
-                    s=80,
-                    marker='^',
-                    edgecolor='k',
-                    linewidths=0.5,
-                    alpha=0.95,
-                    label='Recon masked' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-                ax3.scatter(
-                    orig_x[masked_ids],
-                    orig_y[masked_ids],
-                    orig_z[masked_ids],
-                    facecolor='none',
-                    edgecolor=PLOT_COLORS['masked_joint'],
-                    s=90,
-                    marker='o',
-                    linewidths=1.0,
-                    alpha=0.9,
-                    label='Masked (orig)' if frame_idx == 0 else None,
-                    depthshade=False,
-                )
-            for edge in SKELETON_EDGES:
-                if edge[0] < num_joints and edge[1] < num_joints:
-                    ax3.plot(
-                        [recon_x[edge[0]], recon_x[edge[1]]],
-                        [recon_y[edge[0]], recon_y[edge[1]]],
-                        [recon_z[edge[0]], recon_z[edge[1]]],
-                        color=PLOT_COLORS['reconstructed_edge'],
-                        linewidth=1.6,
-                        alpha=0.75,
-                    )
-            
-            ax3.set_title(f'Reconstructed F{frame_idx+1}')
-            ax3.set_xlabel('X (down +)')
-            ax3.set_ylabel('Y (left +)')
-            ax3.set_zlabel('Z (forward +)')
-            set_axes_equal(
-                ax3,
-                [recon_x, orig_x[masked_ids]],
-                [recon_y, orig_y[masked_ids]],
-                [recon_z, orig_z[masked_ids]],
-                margin=0.08,
-            )
-            set_camera_view(ax3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Sequence reconstruction comparison saved to {save_path}")
+        return
 
-        handles, labels = _unique_legend_entries(legend_entries)
-        if handles:
-            fig.legend(
-                handles,
-                labels,
-                loc='upper center',
-                bbox_to_anchor=(0.5, 0.99),
-                frameon=False,
-                ncol=min(3, len(labels)),
-            )
-    
+    fig = plt.figure(figsize=(4 * seq_len, 12))
+
+    for frame_idx in range(seq_len):
+        base_index = frame_idx + 1
+
+        ax_orig = fig.add_subplot(3, seq_len, base_index, projection='3d')
+        _draw_original_view(
+            ax_orig,
+            orig_coords_list[frame_idx],
+            title=f'Original F{frame_idx + 1}',
+            point_size=30,
+            edge_width=1.1,
+            alpha=0.9,
+        )
+
+        ax_recon = fig.add_subplot(3, seq_len, base_index + seq_len, projection='3d')
+        _draw_reconstructed_plain_view(
+            ax_recon,
+            recon_coords_list[frame_idx],
+            title=f'Reconstruct F{frame_idx + 1}',
+            point_size=40,
+            edge_width=1.4,
+            alpha=0.9,
+        )
+
+        ax_compare = fig.add_subplot(3, seq_len, base_index + 2 * seq_len, projection='3d')
+        _draw_reconstructed_error_view(
+            ax_compare,
+            orig_coords_list[frame_idx],
+            recon_coords_list[frame_idx],
+            masked_indices_per_frame[frame_idx],
+            unmasked_indices_per_frame[frame_idx],
+            title=f'Comparison F{frame_idx + 1}',
+            visible_size=42,
+            masked_size=52,
+            dashed_alpha=0.65,
+            dashed_width=0.9,
+            orig_alpha=0.25,
+        )
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
     print(f"Sequence reconstruction comparison saved to {save_path}")
+
+
+def plot_sequence_mask_overview(original_data, mask_indices, save_path, sample_idx=0):
+    """各フレームのマスク状態を可視化（未マスク:青, マスク:濃いグレー）。"""
+    sample_original = original_data[sample_idx]
+    orig_sequence = to_numpy_array(sample_original)
+    seq_len = orig_sequence.shape[0]
+
+    fig = plt.figure(figsize=(4 * seq_len, 4.2))
+    for frame_idx in range(seq_len):
+        coords = tuple(to_camera_coords(orig_sequence[frame_idx]))
+        masked_ids = get_frame_mask_numpy(mask_indices, sample_idx=sample_idx, frame_idx=frame_idx)
+        ax = fig.add_subplot(1, seq_len, frame_idx + 1, projection='3d')
+        _draw_mask_state_overview(
+            ax,
+            coords,
+            masked_ids,
+            title=f"Mask F{frame_idx + 1}",
+        )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Mask overview saved to {save_path}")
 
 
 class SkeletonDataset(Dataset):
@@ -2049,7 +1994,7 @@ def main(args):
     data_dir = config.get('DATA', {}).get('input_dir', "data/jta_3dp_row") + "/train/"  # JSONデータのディレクトリ
     track_size = config.get('TRAIN', {}).get('track_size', 9)  # トラックサイズ
     frequency = config.get('TRAIN', {}).get('frequency', 1)  # フレームサンプリング頻度
-    save_dir = "skeleton/train"  # 可視化保存ディレクトリ
+    save_dir = "skeleton/train/ckpt"+ str(config.get('MODEL', {}).get('mask_rate', 0.05))+ "5layer"  # 可視化保存ディレクトリ
     
     # 学習パラメータ (coordinate pretraining)
     lr = config.get('MODEL', {}).get('lr', 0.001)

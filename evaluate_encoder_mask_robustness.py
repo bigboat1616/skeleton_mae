@@ -197,7 +197,7 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_batches", type=int, default=10, help="Number of batches to evaluate (0 for all)")
+    parser.add_argument("--max_batches", type=int, default=1000, help="Number of batches to evaluate (0 for all)")
     parser.add_argument("--mask_ratios", type=str, default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
     parser.add_argument("--mask_token", type=str, choices=["zero", "learned"], default="learned",
                         help="Mask token to use when removing joints.")
