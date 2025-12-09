@@ -55,3 +55,6 @@ MODEL:
     beta: 2.0     # Paper: β = 2 for RCE
     # Feature reconstruction parameters
     feature_dim: 128   # D-dimensional feature space for reconstruction
+    encoder_checkpoint_path: ./ckpt/random/2layer/best_model_final.pth 
+    freeze_encoder: true
+    strict_encoder_load: true

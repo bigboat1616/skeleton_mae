@@ -38,7 +38,7 @@ def extract_encoder_features(model: STGCN18Reconstructor, batch: torch.Tensor) -
     Returns tensor of shape [B, T, V, feature_dim].
     """
     data = batch.permute(0, 3, 1, 2).contiguous()  # [B, C, T, V]
-    features, _ = model.encoder.extract_feature(data)
+    features = model.encoder(data) # [B, C, T, V]
     return features.permute(0, 2, 3, 1).contiguous()
 
 
@@ -211,45 +211,45 @@ def evaluate_coordinate_reconstruction(
                 batch_dir = os.path.join(save_dir, f"batch_{batch_idx:03d}")
                 os.makedirs(batch_dir, exist_ok=True)
 
-                # plot_reconstruction_comparison(
-                #     batch.detach().cpu(),
-                #     masked_batch.detach().cpu(),
-                #     reconstructed.detach().cpu(),
-                #     mask_indices,
-                #     os.path.join(batch_dir, "comparison.png"),
-                #     overlay=False,
-                # )
+                plot_reconstruction_comparison(
+                    batch.detach().cpu(),
+                    masked_batch.detach().cpu(),
+                    reconstructed.detach().cpu(),
+                    mask_indices,
+                    os.path.join(batch_dir, "comparison.png"),
+                    overlay=False,
+                )
 
-                # plot_reconstruction_comparison(
-                #     batch.detach().cpu(),
-                #     masked_batch.detach().cpu(),
-                #     reconstructed.detach().cpu(),
-                #     mask_indices,
-                #     os.path.join(batch_dir, "comparison_overlay.png"),
-                #     overlay=True,
-                # )
-                # plot_sequence_reconstruction_comparison(
-                #         batch.detach().cpu(),
-                #         masked_batch.detach().cpu(),
-                #         reconstructed.detach().cpu(),
-                #         mask_indices,
-                #         os.path.join(batch_dir, "sequence.png"),
-                #         overlay=False,
-                #     )
-                # plot_sequence_mask_overview(
-                #         batch.detach().cpu(),
-                #         mask_indices,
-                #         os.path.join(batch_dir, "mask_overview.png"),
-                #     )
+                plot_reconstruction_comparison(
+                    batch.detach().cpu(),
+                    masked_batch.detach().cpu(),
+                    reconstructed.detach().cpu(),
+                    mask_indices,
+                    os.path.join(batch_dir, "comparison_overlay.png"),
+                    overlay=True,
+                )
+                plot_sequence_reconstruction_comparison(
+                        batch.detach().cpu(),
+                        masked_batch.detach().cpu(),
+                        reconstructed.detach().cpu(),
+                        mask_indices,
+                        os.path.join(batch_dir, "sequence.png"),
+                        overlay=False,
+                    )
+                plot_sequence_mask_overview(
+                        batch.detach().cpu(),
+                        mask_indices,
+                        os.path.join(batch_dir, "mask_overview.png"),
+                    )
 
-                # plot_sequence_reconstruction_comparison(
-                #     batch.detach().cpu(),
-                #     masked_batch.detach().cpu(),
-                #     reconstructed.detach().cpu(),
-                #     mask_indices,
-                #     os.path.join(batch_dir, "sequence_overlay.png"),
-                #     overlay=True,
-                # )
+                plot_sequence_reconstruction_comparison(
+                    batch.detach().cpu(),
+                    masked_batch.detach().cpu(),
+                    reconstructed.detach().cpu(),
+                    mask_indices,
+                    os.path.join(batch_dir, "sequence_overlay.png"),
+                    overlay=True,
+                )
 
             # if (batch_idx + 1) % log_every == 0:
             #     print(
@@ -334,10 +334,19 @@ def main():
         out_channels=3,
         feature_dim=feature_dim,
     ).to(device)
+    encoder_total_params = sum(p.numel() for p in model.encoder.parameters())
+    encoder_trainable_params = sum(
+        p.numel() for p in model.encoder.parameters() if p.requires_grad
+    )
+    print(
+        "Encoder parameter count → total: {:,} (trainable: {:,})".format(
+            encoder_total_params, encoder_trainable_params
+        )
+    )
 
     load_checkpoint_flex(model, args.ckpt, map_location=device)
 
-    # print("################",model.mask_token,"################")
+    print("################",model.mask_token,"################")
 
     dataloader = build_val_dataloader(
         config,

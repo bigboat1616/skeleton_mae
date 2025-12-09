@@ -221,21 +221,10 @@ def mask_skeleton_joints(data, mask_ratio=0.15, mask_token=0.0, mask_indices=Non
         mask_indices = []
         for _ in range(batch_size):
             per_frame = []
-            # if batch_idx%2==0:
             num_masked = int(num_joints * mask_ratio)
-            # masked_joints = torch.randperm(num_joints, device=device)[:num_masked]
             for _ in range(seq_len):
-                # 各部位ごとにマスクする関節数を計算
-                # if batch_idx%2==1:
                 masked_joints = torch.randperm(num_joints, device=device)[:num_masked]
                 per_frame.append(masked_joints)
-                # パーツまとめてマスク
-                # chosen = random.sample(PART_GROUPS.keys(), 2)
-                # masked_joints = sorted(set(idx for name in chosen for idx in PART_GROUPS[name]))
-                # per_frame.append(torch.tensor(masked_joints, device=device, dtype=torch.long))
-                # 細かいパーツまとめてマスク
-                # target_joints = sample_bodypart_mask(target=11, tol=1)
-                # per_frame.append(torch.tensor(target_joints, device=device, dtype=torch.long))
             mask_indices.append(per_frame)
 
     if isinstance(mask_token, torch.Tensor):
@@ -997,7 +986,7 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
     unmasked_avg_loss = unmasked_loss_total / unmasked_elem_count if unmasked_elem_count > 0 else torch.tensor(0.0, device=device)
     
     # 総損失
-    total_loss = masked_avg_loss
+    total_loss = masked_avg_loss + unmasked_avg_loss
     
     # 統計情報
     avg_masked_joints = (masked_joint_tally / total_frames) if total_frames > 0 else 0.0
@@ -1034,6 +1023,7 @@ class STGCN18Reconstructor(nn.Module):
         self.out_channels = out_channels
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, in_channels))
+
         graph_cfg = {
             'layout': 'jta_3dp_row',
             'strategy': 'distance',
@@ -1047,35 +1037,10 @@ class STGCN18Reconstructor(nn.Module):
             graph_cfg=graph_cfg,
             edge_importance_weighting=True,
             data_bn=True,
-            layer_num = 4
+            layer_num = 2
         )
 
         self.coord_decoder = nn.Linear(feature_dim, out_channels)
-        # MLP for feature decoding
-        # self.coord_decoder = nn.Sequential(
-        #     nn.Linear(feature_dim, feature_dim),
-        #     nn.ReLU(),
-        #     nn.Linear(feature_dim, out_channels),
-        # )
-        # self.coord_decoder_stgcn = ST_GCN_18(
-        #     in_channels=feature_dim,
-        #     feature_dim=feature_dim,
-        #     graph_cfg=graph_cfg,
-        #     edge_importance_weighting=True,
-        #     data_bn=True,
-        #     layer_num=1
-        # )
-
-        # self.coord_decoder_gcn = GCN(
-        #     in_channels=feature_dim,
-        #     feature_dim=out_channels,
-        #     graph_cfg=graph_cfg,
-        #     edge_importance_weighting=True,
-        #     data_bn=True,
-        #     layer_num=1
-        # )
-
-        # self.coord_decoder_linear = nn.Linear(feature_dim, out_channels)
 
     def forward(self, x):
         batch_size, seq_len, num_joints, _ = x.shape # [N, T, V, C]
@@ -1086,6 +1051,61 @@ class STGCN18Reconstructor(nn.Module):
         reconstructed = decoded.view(batch_size, seq_len, num_joints, self.out_channels) # [N, T, V, 3]
 
         return reconstructed
+
+    def load_encoder_weights(self, checkpoint_path, *, map_location='cpu', strict=True):
+        """
+        事前学習済みエンコーダ重みを読み込み。
+        checkpointは以下のフォーマットをサポート:
+            - {'encoder_state_dict': {...}}
+            - {'model_state_dict': {...}}（キーに'encoder.'を含む部分のみ使用）
+            - PyTorch state_dict そのもの
+        """
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path must be provided to load encoder weights.")
+
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+
+        if isinstance(checkpoint, dict):
+            if 'encoder_state_dict' in checkpoint:
+                state_dict = checkpoint['encoder_state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = {k: v for k, v in checkpoint['model_state_dict'].items() if k.startswith('encoder.')}
+            elif 'state_dict' in checkpoint:
+                state_dict = {k: v for k, v in checkpoint['state_dict'].items() if k.startswith('encoder.')}
+            else:
+                state_dict = checkpoint
+        else:
+            raise ValueError(f"Unsupported checkpoint format type={type(checkpoint)}")
+
+        processed_state = {}
+        skipped_keys = []
+        valid_keys = set(self.encoder.state_dict().keys())
+        for key, tensor in state_dict.items():
+            trimmed_key = key
+            if trimmed_key.startswith('module.'):
+                trimmed_key = trimmed_key[len('module.'):]
+            if trimmed_key.startswith('encoder.'):
+                trimmed_key = trimmed_key[len('encoder.'):]
+            if trimmed_key in valid_keys:
+                processed_state[trimmed_key] = tensor
+            elif key in valid_keys:
+                processed_state[key] = tensor
+            else:
+                skipped_keys.append(key)
+
+        missing, unexpected = self.encoder.load_state_dict(processed_state, strict=strict)
+        if missing:
+            logging.warning(f"Missing encoder keys during load: {missing}")
+        if unexpected:
+            logging.warning(f"Unexpected encoder keys during load: {unexpected}")
+        if skipped_keys:
+            logging.info(f"Skipped non-encoder keys while loading: {skipped_keys}")
+
+    def freeze_encoder(self):
+        """エンコーダのパラメータを凍結"""
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.encoder.eval()
 
 def calculate_joint_errors(original, reconstructed, mask_indices, device, sample_idx=0):
     """
@@ -1228,7 +1248,22 @@ def calculate_masked_unmasked_batch_errors(original, reconstructed, mask_indices
 
 
 
-def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.001, weight_decay=0.01, save_dir=None, random_seed=42, loss_fn='mse', beta=2.0, feature_dim=256):
+def skeleton_pretrain(
+    dataloader,
+    device,
+    mask_ratio=0.15,
+    max_epochs=100,
+    lr=0.001,
+    weight_decay=0.01,
+    save_dir=None,
+    random_seed=42,
+    loss_fn='mse',
+    beta=2.0,
+    feature_dim=256,
+    encoder_checkpoint_path=None,
+    freeze_encoder=False,
+    strict_encoder_load=True,
+):
     """
     スケルトンデータに対するLinear再構成pretraining
     
@@ -1239,6 +1274,9 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
         max_epochs: 最大エポック数
         lr: 学習率
         save_dir: 保存ディレクトリ
+        encoder_checkpoint_path: 事前学習済みエンコーダ重みのパス
+        freeze_encoder: Trueの場合エンコーダを凍結してデコーダのみ学習
+        strict_encoder_load: load_state_dict時のstrictフラグ
     
     Returns:
         model: 学習済みモデル
@@ -1264,19 +1302,40 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
     
     # モデル初期化（ST-GCN-18ベース）
     model = STGCN18Reconstructor(in_channels=3, out_channels=3, feature_dim=feature_dim).to(device)
+    if encoder_checkpoint_path:
+        print(f"  - Loading encoder weights from: {encoder_checkpoint_path}")
+        model.load_encoder_weights(
+            encoder_checkpoint_path,
+            map_location=device,
+            strict=strict_encoder_load,
+        )
+        print("  - Encoder weights loaded.")
+    if freeze_encoder:
+        model.freeze_encoder()
+        print("  - Encoder parameters frozen.")
     print(f"Model initialized:")
     print(f"  - Model type: ST-GCN-18 Coordinate Reconstructor")
     print(f"  - Encoder: ST-GCN-18")
     print(f"  - Input channels: 3")
     print(f"  - Output channels: 3")
     print(f"  - Feature dimension: {feature_dim}")
+    if freeze_encoder:
+        frozen_params = sum(p.numel() for p in model.encoder.parameters() if not p.requires_grad)
+        print(f"  - Frozen encoder parameters: {frozen_params:,}")
     
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain. Check freeze settings.")
+    
+    optimizer = optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
     
     # 学習率スケジューラー（段階的減衰）
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
     
-    print(f"  - Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    total_param_count = sum(p.numel() for p in model.parameters())
+    trainable_param_count = sum(p.numel() for p in trainable_params)
+    print(f"  - Total parameters: {total_param_count:,}")
+    print(f"  - Trainable parameters: {trainable_param_count:,}")
     print(f"  - Device: {device}")
     
     # 学習履歴
@@ -1309,7 +1368,6 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
     fixed_masked, fixed_mask_indices = mask_skeleton_joints(
         fixed_batch, mask_ratio=mask_ratio, mask_token=model.mask_token
     )
-    print("mask_token: ", model.mask_token)
     fixed_union = [collapse_mask_indices(mask_idx) for mask_idx in fixed_mask_indices]
     print(f"Fixed batch for reconstruction tracking: {fixed_batch.shape}")
     print(f"Fixed masked joint indices: {fixed_mask_indices}")
@@ -1320,6 +1378,8 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
     
     # 学習ループ
     model.train()
+    if freeze_encoder:
+        model.encoder.eval()
     epoch_iter = tqdm(range(max_epochs), desc="Training")
 
     for epoch in epoch_iter:
@@ -1350,7 +1410,7 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
             loss.backward()
             
             # 勾配クリッピング（安定化）
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             
             optimizer.step()
             
@@ -1424,6 +1484,8 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
                 print(f"  ✅ Sequence reconstruction plot saved: sequence_reconstruction_epoch_{epoch+1:03d}.png")
 
             model.train()
+            if freeze_encoder:
+                model.encoder.eval()
         
         # 学習率スケジューラー更新
             scheduler.step()
@@ -1991,7 +2053,7 @@ def main(args):
     print("=" * 60)
     
     # YAML設定を読み込み
-    config_path = "configs_skeleton.yml"
+    config_path = "decoder_check.yml"
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -2022,6 +2084,25 @@ def main(args):
     loss_fn = config.get('MODEL', {}).get('loss_fn', 'mse')
     beta = config.get('MODEL', {}).get('beta', 2.0)
     feature_dim = config.get('MODEL', {}).get('feature_dim', 64)
+    encoder_checkpoint_path = config.get('MODEL', {}).get('encoder_checkpoint_path', None)
+    freeze_encoder = config.get('MODEL', {}).get('freeze_encoder', False)
+    strict_encoder_load = config.get('MODEL', {}).get('strict_encoder_load', True)
+
+    def _to_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {'1', 'true', 'yes', 'y'}
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    # 引数での上書き（存在する場合のみ）
+    encoder_checkpoint_path = getattr(args, 'encoder_checkpoint_path', encoder_checkpoint_path)
+    if isinstance(encoder_checkpoint_path, str) and encoder_checkpoint_path.strip().lower() in {'', 'none', 'null'}:
+        encoder_checkpoint_path = None
+    freeze_encoder = _to_bool(getattr(args, 'freeze_encoder', freeze_encoder), default=False)
+    strict_encoder_load = _to_bool(getattr(args, 'strict_encoder_load', strict_encoder_load), default=True)
 
     
     print(f"Configuration:")
@@ -2035,6 +2116,9 @@ def main(args):
     if loss_fn == 'rce':
         print(f"  - Beta (RCE): {beta}")
     print(f"  - Feature dimension: {feature_dim}")
+    print(f"  - Encoder checkpoint: {encoder_checkpoint_path}")
+    print(f"  - Freeze encoder: {freeze_encoder}")
+    print(f"  - Strict encoder load: {strict_encoder_load}")
     print(f"  - Track size: {track_size}")
     print(f"  - Frequency: {frequency}")
     print(f"  - Data directory: {data_dir}")
@@ -2098,7 +2182,10 @@ def main(args):
         save_dir=save_dir,
         loss_fn=loss_fn,
         beta=beta,
-        feature_dim=feature_dim
+        feature_dim=feature_dim,
+        encoder_checkpoint_path=encoder_checkpoint_path,
+        freeze_encoder=freeze_encoder,
+        strict_encoder_load=strict_encoder_load,
     )
     
     print("\nPretraining completed!")
@@ -2107,6 +2194,6 @@ def main(args):
 if __name__ == "__main__":
     args = build_args()
     if args.use_cfg:
-        args = load_best_configs(args, "configs_skeleton.yml")
+        args = load_best_configs(args, "decoder_check.yml")
     print(args)
     main(args)

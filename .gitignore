@@ -127,3 +127,15 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+skeleton/
+
+logs/
+
+nohup.out
+nohup_1.out
+nohup2.out
+nohup3.out
+
+ckpt/
+skeleton/val_coord_visualizations/

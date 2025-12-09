@@ -861,6 +861,16 @@ def _collect_axis_values(arrays):
     return np.concatenate(flattened)
 
 
+def extract_encoder_features(model: STGCN18Reconstructor, batch: torch.Tensor) -> torch.Tensor:
+    """
+    Encode skeleton sequences via ST-GCN encoder.
+    Returns tensor of shape [B, T, V, feature_dim].
+    """
+    data = batch.permute(0, 3, 1, 2).contiguous()  # [B, C, T, V]
+    features = model.encoder(data) # [B, C, T, V]
+    return features.permute(0, 2, 3, 1).contiguous()
+
+
 def set_axes_equal(ax, x_arrays, y_arrays, z_arrays, margin=0.05):
     """Set equal scale on all axes while keeping a configurable margin."""
     x_vals = _collect_axis_values(x_arrays)
@@ -895,42 +905,12 @@ def set_camera_view(ax, elev=None, azim=None):
         # Older matplotlib versions may not support set_proj_type
         pass
 
-
-def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type='mse', beta=2.0):
-    """
-    再構成損失を計算する（MSEまたはRCE）
-    
-    Args:
-        original: 元のスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        reconstructed: 再構成されたスケルトンデータ [batch_size, seq_len, num_joints, 3]
-        mask_indices: マスクされた関節のインデックス
-        loss_type: 損失関数のタイプ ('mse', 'l1', 'rce')
-        beta: RCEの重み付けパラメータ（β ≥ 1）
-    
-    Returns:
-        loss: 損失値
-        loss_dict: 損失の詳細情報
-    """
-    batch_size, seq_len, num_joints, _ = original.shape
-    device = original.device
-    
-    # 損失関数の選択
-    if loss_type == 'mse':
-        loss_fn = nn.MSELoss(reduction='none')
-    elif loss_type == 'l1':
-        loss_fn = nn.L1Loss(reduction='none')
-    elif loss_type == 'rce':
-        # RCE (Re-weighted Cosine Error) の実装
-        def rce_loss(x, y, beta=beta):
-            """
-            Re-weighted Cosine Error
-            LRCE = Σ(1/|V| - (xT·y)/(|V|×||x||×||y||))^β
-            """
-            batch_size, seq_len, num_joints, coords = x.shape
+def rce_loss(x, y, beta=beta):
+            batch_size, seq_len, num_joints, feature_dim = x.shape
             
             # 各関節のコサイン類似度を計算
-            x_flat = x.view(batch_size, seq_len, num_joints, coords)  # [batch_size, seq_len, num_joints, 3]
-            y_flat = y.view(batch_size, seq_len, num_joints, coords)  # [batch_size, seq_len, num_joints, 3]
+            x_flat = x.view(batch_size, seq_len, num_joints, feature_dim)  # [batch_size, seq_len, num_joints, feature_dim]
+            y_flat = y.view(batch_size, seq_len, num_joints, feature_dim)  # [batch_size, seq_len, num_joints, feature_dim]
             
             # 各関節のノルムを計算
             x_norm = torch.norm(x_flat, dim=3, keepdim=True)  # [batch_size, seq_len, num_joints, 1]
@@ -943,14 +923,33 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
             rce = torch.pow(1 - cosine_sim, beta)
             
             # 形状を [batch_size, seq_len, num_joints, 3] に合わせる
-            rce_expanded = rce.expand(batch_size, seq_len, num_joints, coords)
+            rce_expanded = rce.expand(batch_size, seq_len, num_joints, feature_dim)
             
             return rce_expanded
-        
-        loss_fn = rce_loss
-    else:
-        loss_fn = nn.MSELoss(reduction='none')
+
+def compute_reconstruction_loss(original, reconstructed, clean_encoded, masked_encoded, mask_indices, loss_type='mse', beta=2.0):
+    """
+    再構成損失を計算する（MSEまたはRCE）
     
+    Args:
+        original: 元のスケルトンデータ [batch_size, seq_len, num_joints, 3]
+        reconstructed: 再構成されたスケルトンデータ [batch_size, seq_len, num_joints, 3]
+        clean_encoded: クリーンなエンコードされた特徴 [batch_size, seq_len, num_joints, feature_dim]
+        masked_encoded: マスクされたエンコードされた特徴 [batch_size, seq_len, num_joints, feature_dim]
+        mask_indices: マスクされた関節のインデックス
+        loss_type: 損失関数のタイプ ('mse', 'l1', 'rce')
+        beta: RCEの重み付けパラメータ（β ≥ 1）
+    
+    Returns:
+        loss: 損失値
+        loss_dict: 損失の詳細情報
+    """
+    batch_size, seq_len, num_joints, _ = original.shape
+    device = original.device
+    
+
+    loss_fn = nn.MSELoss(reduction='none')
+  
     # 全関節の損失を計算
     all_losses = loss_fn(reconstructed, original)  # [batch_size, seq_len, num_joints, 3]
     
@@ -996,9 +995,10 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
     masked_avg_loss = masked_loss_total / masked_elem_count if masked_elem_count > 0 else torch.tensor(0.0, device=device)
     unmasked_avg_loss = unmasked_loss_total / unmasked_elem_count if unmasked_elem_count > 0 else torch.tensor(0.0, device=device)
     
-    # 総損失
-    total_loss = masked_avg_loss
+    # backwardされる損失
+    caluculateed_loss = masked_avg_loss 
     
+    total_loss = masked_avg_loss + unmasked_avg_loss 
     # 統計情報
     avg_masked_joints = (masked_joint_tally / total_frames) if total_frames > 0 else 0.0
     avg_unmasked_joints = (unmasked_joint_tally / total_frames) if total_frames > 0 else 0.0
@@ -1021,7 +1021,7 @@ def compute_reconstruction_loss(original, reconstructed, mask_indices, loss_type
         'num_unmasked_joints': avg_unmasked_joints,
     }
     
-    return total_loss, loss_dict
+    return caluculateed_loss, loss_dict
 
 
 class STGCN18Reconstructor(nn.Module):
@@ -1047,16 +1047,16 @@ class STGCN18Reconstructor(nn.Module):
             graph_cfg=graph_cfg,
             edge_importance_weighting=True,
             data_bn=True,
-            layer_num = 4
+            layer_num = 2
         )
 
-        self.coord_decoder = nn.Linear(feature_dim, out_channels)
+        # self.coord_decoder = nn.Linear(feature_dim, out_channels)
         # MLP for feature decoding
-        # self.coord_decoder = nn.Sequential(
-        #     nn.Linear(feature_dim, feature_dim),
-        #     nn.ReLU(),
-        #     nn.Linear(feature_dim, out_channels),
-        # )
+        self.coord_decoder = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, out_channels),
+        )
         # self.coord_decoder_stgcn = ST_GCN_18(
         #     in_channels=feature_dim,
         #     feature_dim=feature_dim,
@@ -1337,9 +1337,14 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
 
             # マスクされた座標から再構成
             reconstructed = model(masked_batch)
+            clean_encoded = extract_encoder_features(model, batch)
+            masked_encoded = extract_encoder_features(model, masked_batch)
+
             loss, loss_dict = compute_reconstruction_loss(
                 batch,
                 reconstructed,
+                clean_encoded,
+                masked_encoded,
                 mask_indices,
                 loss_type=loss_fn,
                 beta=beta
@@ -1495,8 +1500,10 @@ def skeleton_pretrain(dataloader, device, mask_ratio=0.15, max_epochs=100, lr=0.
     with torch.no_grad():
         # 座標空間での評価
         test_reconstructed = model(test_masked)
+        clean_encoded = extract_encoder_features(model, test_batch)
+        masked_encoded = extract_encoder_features(model, test_masked)
         final_loss, final_loss_dict = compute_reconstruction_loss(
-            test_batch, test_reconstructed, test_mask_indices,
+            test_batch, test_reconstructed, clean_encoded, masked_encoded, test_mask_indices,
             loss_type=loss_fn, beta=beta
         )
     
