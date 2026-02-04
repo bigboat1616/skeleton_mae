@@ -6,12 +6,10 @@ import logging
 from functools import partial
 import numpy as np
 
-import dgl
 
 import torch
 import torch.nn as nn
 from torch import optim as optim
-from tensorboardX import SummaryWriter
 
 
 
@@ -42,9 +40,9 @@ def get_current_lr(optimizer):
 def build_args():
     parser = argparse.ArgumentParser(description="GAT")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
-    parser.add_argument("--dataset", type=str, default="cora")
+    parser.add_argument("--dataset", type=str, default="jta_3dp_row")
     parser.add_argument("--device", type=int, default=-1)
-    parser.add_argument("--max_epoch", type=int, default=200,
+    parser.add_argument("--max_epoch", type=int, default=50,
                         help="number of training epochs")
     parser.add_argument("--warmup_steps", type=int, default=-1)
 

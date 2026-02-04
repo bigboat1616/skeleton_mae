@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CKPT_DEFAULTS=("0.1" "0.2" "0.3" "0.4" "0.5" "0.6" "0.7" "0.8" "0.9")
-LAYER_TAGS=("2layer")
+LAYER_TAGS=( "0.1" "0.2" "0.3" "0.4" "0.5" "0.6" "0.7" "0.8" "0.9")
 declare -a CKPT_PATHS=()
 
 if [[ $# -gt 0 ]]; then
@@ -11,7 +11,7 @@ if [[ $# -gt 0 ]]; then
   done
 else
   for layer_tag in "${LAYER_TAGS[@]}"; do
-    CKPT_PATHS+=("./ckpt/random/${layer_tag}/best_model_final.pth")
+    CKPT_PATHS+=("./ckpt/${layer_tag}_m+u/checkpoints/best_model_final.pth")
   done
 fi
 

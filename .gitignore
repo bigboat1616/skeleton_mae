@@ -132,10 +132,9 @@ skeleton/
 
 logs/
 
-nohup.out
-nohup_1.out
-nohup2.out
-nohup3.out
+*.out
 
 ckpt/
+ckpt_old/
 skeleton/val_coord_visualizations/
+

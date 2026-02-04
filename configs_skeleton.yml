@@ -9,7 +9,7 @@ TRAIN:
     num_workers: 0
     input_track_size: 9
     output_track_size: 9
-    track_size: 16
+    track_size: 9
     frequency: 1
     lr: 0.00015     # Paper: 1.5e-4
     lr_decay: 0.95
@@ -21,14 +21,13 @@ TRAIN:
 
 # Data Configuration
 DATA:
-    name: jta_3dp_row
+    name: jta_3dp
     train_datasets:
-        - jta_3dp_row
+        - jta_3dp
     input_dir: data/jta_3dp
     split: train
-    scene_type: rows
     test_datasets:
-        - jta_3dp_row
+        - jta_3dp
     test_split: test
 
 # Model Configuration (Paper: PReLU activation, mask_rate=0.15)
@@ -41,7 +40,7 @@ MODEL:
     max_masked_weight: 3.0  # Increased for better reconstruction
     random_seed: 42
     num_hidden: 256
-    num_layers: 2
+    num_layers: 3
     encoder: stgcn
     decoder: linear
     activation: prelu  # Paper: PReLU activation

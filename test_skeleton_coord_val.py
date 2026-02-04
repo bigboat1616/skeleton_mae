@@ -1,4 +1,5 @@
 import os
+import time
 import yaml
 import torch
 import random
@@ -13,6 +14,8 @@ from main_skeleton_coord import (
     SkeletonDataset,
     mask_skeleton_joints,
     compute_reconstruction_loss,
+)
+from utils import (
     calculate_masked_unmasked_batch_errors,
     plot_reconstruction_comparison,
     plot_sequence_reconstruction_comparison,
@@ -53,14 +56,10 @@ def load_checkpoint_flex(model, ckpt_path, map_location="cpu"):
 
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         state = ckpt["model_state_dict"]
-        # missing, unexpected = model.load_state_dict(state, strict=False)
-        # print(
-        #     f"Loaded full model_state_dict. Missing: {len(missing)}, Unexpected: {len(unexpected)}"
-        # )
-        # if missing:
-        #     print(f"  Missing keys: {missing}")
-        # if unexpected:
-        #     print(f"  Unexpected keys: {unexpected}")
+        model_state = model.load_state_dict(state, strict=False)
+        missing = [k for k in state.keys() if k not in model_state]
+        if missing:
+            print(f"  Missing keys: {missing}")
     elif isinstance(ckpt, dict) and "encoder_state_dict" in ckpt:
         enc_state = ckpt["encoder_state_dict"]
         model_state = model.state_dict()
@@ -83,7 +82,7 @@ def load_checkpoint_flex(model, ckpt_path, map_location="cpu"):
 
 
 def build_val_dataloader(config, batch_size=4, num_workers=0):
-    input_dir = config.get("DATA", {}).get("input_dir", "data/jta_3dp_row")
+    input_dir = config.get("DATA", {}).get("input_dir", "data/jta_3dp")
     data_dir = os.path.join(input_dir, "test")
     track_size = config.get("TRAIN", {}).get("track_size", 9)
     sequence_length = config.get("TRAIN", {}).get("input_track_size", 9)
@@ -154,6 +153,10 @@ def evaluate_coordinate_reconstruction(
 
     best_sample_error = None
     best_sample_info = None
+    total_batches = 0
+    total_samples = 0
+    inference_time_total = 0.0
+    hazurechi = 0.0
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -164,16 +167,23 @@ def evaluate_coordinate_reconstruction(
                 break
 
             batch = batch.to(device)
+            batch_size = batch.size(0)
+            total_batches += 1
+            total_samples += batch_size
 
             masked_batch, mask_indices = mask_skeleton_joints(
                 batch, mask_ratio=mask_ratio, mask_token=model.mask_token
             )
 
             # Clean vs masked encoder features
-            clean_features = extract_encoder_features(model, batch)
+            clean_features = model.encoder(batch.permute(0, 3, 1, 2).contiguous())
 
+            batch_infer_start = time.perf_counter()
             reconstructed = model(masked_batch)
-            masked_features = extract_encoder_features(model, masked_batch)
+            batch_infer_end = time.perf_counter()
+            inference_time_total += batch_infer_end - batch_infer_start
+
+            masked_features = model.encoder(masked_batch.permute(0, 3, 1, 2).contiguous())
 
             loss, loss_dict = compute_reconstruction_loss(
                 batch,
@@ -193,7 +203,9 @@ def evaluate_coordinate_reconstruction(
                     "sample_idx": batch_min_idx.item(),
                     "error": best_sample_error,
                 }
-
+            if loss.item() > 10:
+                hazurechi += 1
+                continue
             total_losses.append(loss.item())
             masked_losses.append(loss_dict["masked_joints_loss_mean"])
             per_batch_stats.append(loss_dict)
@@ -211,54 +223,53 @@ def evaluate_coordinate_reconstruction(
                 batch_dir = os.path.join(save_dir, f"batch_{batch_idx:03d}")
                 os.makedirs(batch_dir, exist_ok=True)
 
-                plot_reconstruction_comparison(
-                    batch.detach().cpu(),
-                    masked_batch.detach().cpu(),
-                    reconstructed.detach().cpu(),
-                    mask_indices,
-                    os.path.join(batch_dir, "comparison.png"),
-                    overlay=False,
-                )
+                # if batch_idx == 64:
+                #     plot_reconstruction_comparison(
+                #         batch.detach().cpu(),
+                #         masked_batch.detach().cpu(),
+                #         reconstructed.detach().cpu(),
+                #         mask_indices,
+                #         os.path.join(batch_dir, "comparison.png"),
+                #         overlay=False,
+                #     )
 
-                plot_reconstruction_comparison(
-                    batch.detach().cpu(),
-                    masked_batch.detach().cpu(),
-                    reconstructed.detach().cpu(),
-                    mask_indices,
-                    os.path.join(batch_dir, "comparison_overlay.png"),
-                    overlay=True,
-                )
-                plot_sequence_reconstruction_comparison(
-                        batch.detach().cpu(),
-                        masked_batch.detach().cpu(),
-                        reconstructed.detach().cpu(),
-                        mask_indices,
-                        os.path.join(batch_dir, "sequence.png"),
-                        overlay=False,
-                    )
-                plot_sequence_mask_overview(
-                        batch.detach().cpu(),
-                        mask_indices,
-                        os.path.join(batch_dir, "mask_overview.png"),
-                    )
+                #     plot_reconstruction_comparison(
+                #         batch.detach().cpu(),
+                #         masked_batch.detach().cpu(),
+                #         reconstructed.detach().cpu(),
+                #         mask_indices,
+                #         os.path.join(batch_dir, "comparison_overlay.png"),
+                #         overlay=True,
+                #     )
+                #     plot_sequence_reconstruction_comparison(
+                #             batch.detach().cpu(),
+                #             masked_batch.detach().cpu(),
+                #             reconstructed.detach().cpu(),
+                #             mask_indices,
+                #             os.path.join(batch_dir, "sequence.png"),
+                #             overlay=False,
+                #         )
+                #     plot_sequence_mask_overview(
+                #             batch.detach().cpu(),
+                #             mask_indices,
+                #             os.path.join(batch_dir, "mask_overview.png"),
+                #         )
 
-                plot_sequence_reconstruction_comparison(
-                    batch.detach().cpu(),
-                    masked_batch.detach().cpu(),
-                    reconstructed.detach().cpu(),
-                    mask_indices,
-                    os.path.join(batch_dir, "sequence_overlay.png"),
-                    overlay=True,
-                )
+                # plot_sequence_reconstruction_comparison(
+                #         batch.detach().cpu(),
+                #         masked_batch.detach().cpu(),
+                #         reconstructed.detach().cpu(),
+                #         mask_indices,
+                #         os.path.join(batch_dir, "sequence_overlay.png"),
+                #         overlay=True,
+                #     )
+                # print((batch.detach().cpu()-reconstructed.detach().cpu()).norm(dim=-1).mean())
 
             # if (batch_idx + 1) % log_every == 0:
             #     print(
             #         f"[Batch {batch_idx + 1}] "
             #         f"loss={loss.item():.6f}, masked={loss_dict['masked_joints_loss_mean']:.6f}"
             #     )
-
-    if len(originals) == 0:
-        raise RuntimeError("No batches evaluated.")
 
     if best_sample_info is not None:
         print(
@@ -286,6 +297,11 @@ def evaluate_coordinate_reconstruction(
     summary["cosine_similarity_mean"] = float(cosine_cat.mean().item()) if cosine_sims else 0.0
     summary["cosine_similarity_std"] = float(cosine_cat.std(unbiased=False).item()) if cosine_cat.numel() > 0 else 0.0
     summary["cosine_similarity_values"] = cosine_cat.tolist() if cosine_sims else []
+    summary["total_batches"] = total_batches
+    summary["total_samples"] = total_samples
+    summary["inference_time_total"] = inference_time_total
+    summary["inference_time_per_batch"] = inference_time_total / max(total_batches, 1)
+    summary["inference_time_per_sample"] = inference_time_total / max(total_samples, 1)
 
     return summary
 
@@ -334,9 +350,16 @@ def main():
         out_channels=3,
         feature_dim=feature_dim,
     ).to(device)
+    model_total_params = sum(p.numel() for p in model.parameters())
+    model_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     encoder_total_params = sum(p.numel() for p in model.encoder.parameters())
     encoder_trainable_params = sum(
         p.numel() for p in model.encoder.parameters() if p.requires_grad
+    )
+    print(
+        "Model parameter count → total: {:,} (trainable: {:,})".format(
+            model_total_params, model_trainable_params
+        )
     )
     print(
         "Encoder parameter count → total: {:,} (trainable: {:,})".format(
@@ -355,6 +378,7 @@ def main():
     )
 
     # print(f"\nSaving visualizations to: {args.save_dir}")
+    eval_start = time.perf_counter()
     stats = evaluate_coordinate_reconstruction(
         model,
         dataloader,
@@ -365,6 +389,18 @@ def main():
         loss_type=args.loss_type,
         beta=args.beta,
         log_every=args.log_every,
+    )
+    eval_end = time.perf_counter()
+    eval_duration = eval_end - eval_start
+    avg_time_per_batch = eval_duration / max(stats["total_batches"], 1)
+    avg_time_per_sample = eval_duration / max(stats["total_samples"], 1)
+    samples_per_second = (
+        stats["total_samples"] / eval_duration if eval_duration > 0 else 0.0
+    )
+    inference_samples_per_second = (
+        stats["total_samples"] / stats["inference_time_total"]
+        if stats["inference_time_total"] > 0
+        else 0.0
     )
 
     summary_lines = [
@@ -381,6 +417,16 @@ def main():
         f"Average micro mean:    {(stats['micro_masked_mean']*stats['total_masked_instances']+stats['micro_unmasked_mean']*stats['total_unmasked_instances'])/(stats['total_masked_instances']+stats['total_unmasked_instances']):.6f} m",
         f"Cosine similarity mean: {stats['cosine_similarity_mean']:.6f}",
         f"Cosine similarity std:  {stats['cosine_similarity_std']:.6f}",
+        f"Evaluation batches:     {stats['total_batches']}",
+        f"Evaluation samples:     {stats['total_samples']}",
+        f"Evaluation time:        {eval_duration:.2f} s",
+        f"Avg time per batch:     {avg_time_per_batch:.3f} s",
+        f"Avg time per sample:    {avg_time_per_sample:.4f} s",
+        f"Samples per second:     {samples_per_second:.2f}" if eval_duration > 0 else "Samples per second:     N/A",
+        f"Inference time total:   {stats['inference_time_total']:.2f} s",
+        f"Infer time per batch:   {stats['inference_time_per_batch']:.3f} s",
+        f"Infer time per sample:  {stats['inference_time_per_sample']:.4f} s",
+        f"Infer samples/sec:      {inference_samples_per_second:.2f}" if stats["inference_time_total"] > 0 else "Infer samples/sec:      N/A",
     ]
 
     print()
